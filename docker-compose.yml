@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  sing-box-manager:
+    build: .
+    container_name: sing-box-manager
+    ports:
+      - "8080:8080"   # 管理API
+      - "443:443"     # Trojan
+      - "1080:1080"   # Mixed proxy  
+      - "8443:8443"   # VLESS
+      - "4433:4433"   # VLESS Reality
+    volumes:
+      - ./data:/root/data
+      - ./configs:/root/configs
+    environment:
+      - GIN_MODE=release
+      - PORT=8080
+      - DATA_FILE=data/users.json
+      - SINGBOX_CONFIG=configs/sing-box.json
+      - SERVER_NAME=your-domain.com
+    restart: unless-stopped
+    networks:
+      - sing-box-network
+
+networks:
+  sing-box-network:
+    driver: bridge
+
+volumes:
+  data:
+    driver: local

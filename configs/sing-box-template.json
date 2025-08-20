@@ -1,0 +1,26 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {"tag": "cloudflare", "address": "1.1.1.1"},
+      {"tag": "local", "address": "local", "detour": "direct"}
+    ],
+    "rules": [
+      {"domain_suffix": [".cn"], "server": "local"}
+    ]
+  },
+  "inbounds": [],
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block", "tag": "block"}
+  ],
+  "route": {
+    "rules": [
+      {"protocol": "dns", "outbound": "dns-out"},
+      {"ip_is_private": true, "outbound": "direct"}
+    ]
+  }
+}
