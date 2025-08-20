@@ -122,7 +122,7 @@ download_components() {
     # 解压并安装sing-box
     tar -xzf sing-box.tar.gz
     sudo mv sing-box-*/sing-box /usr/local/bin/
-    rm -rf sing-box*
+    rm -rf sing-box.tar.gz sing-box-1.8.10-linux-amd64
     
     # 验证安装
     if ! command -v sing-box &> /dev/null; then
