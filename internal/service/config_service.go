@@ -245,6 +245,7 @@ func (s *ConfigService) buildConfig(users []*models.User) *SingBoxConfig {
 		Tag  string `json:"tag"`
 	}{
 		{Type: "direct", Tag: "direct"},
+		{Type: "direct", Tag: "dns-out"},
 		{Type: "block", Tag: "block"},
 	}
 
