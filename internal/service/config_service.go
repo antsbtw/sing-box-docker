@@ -105,7 +105,7 @@ type UserConfig struct {
 
 // getRealityPrivateKey 获取Reality私钥
 func (s *ConfigService) getRealityPrivateKey() string {
-	keyFile := "/root/configs/reality_private.key"
+	keyFile := "configs/reality_private.key"
 	
 	// 如果私钥文件存在，读取它
 	if data, err := os.ReadFile(keyFile); err == nil {
@@ -195,8 +195,8 @@ func (s *ConfigService) buildConfig(users []*models.User) *SingBoxConfig {
 			TLS: &TLSConfig{
 				Enabled:         true,
 				ServerName:      s.serverName,
-				CertificatePath: "/root/configs/cert.pem",
-				KeyPath:         "/root/configs/key.pem",
+				CertificatePath: "configs/cert.pem",
+				KeyPath:         "configs/key.pem",
 			},
 			Users: s.buildTrojanUsers(users),
 		},
@@ -210,8 +210,8 @@ func (s *ConfigService) buildConfig(users []*models.User) *SingBoxConfig {
 			TLS: &TLSConfig{
 				Enabled:         true,
 				ServerName:      s.serverName,
-				CertificatePath: "/root/configs/cert.pem",
-				KeyPath:         "/root/configs/key.pem",
+				CertificatePath: "configs/cert.pem",
+				KeyPath:         "configs/key.pem",
 			},
 			Users: s.buildVlessUsers(users),
 		},
@@ -336,7 +336,7 @@ func (s *ConfigService) GenerateRealityKeypair() (map[string]string, error) {
 	
 	// 保存私钥
 	if privateKey, exists := result["private_key"]; exists {
-		os.WriteFile("/root/configs/reality_private.key", []byte(privateKey), 0600)
+		os.WriteFile("configs/reality_private.key", []byte(privateKey), 0600)
 	}
 	
 	return result, nil
