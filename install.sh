@@ -101,7 +101,7 @@ download_components() {
     
     # 下载管理程序
     log_info "下载 sing-box 管理程序..."
-    if ! wget -q --show-progress -O sing-box-manager-linux https://github.com/antsbtw/sing-box-docker/raw/main/sing-box-manager-linux; then
+    if ! wget -O sing-box-manager-linux https://github.com/antsbtw/sing-box-docker/raw/main/sing-box-manager-linux; then
         log_error "下载管理程序失败"
         exit 1
     fi
@@ -114,7 +114,7 @@ download_components() {
     fi
     
     log_info "下载 sing-box 核心程序..."
-    if ! wget -q --show-progress -O sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.8.10/sing-box-1.8.10-linux-amd64.tar.gz; then
+    if ! wget -O sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.8.10/sing-box-1.8.10-linux-amd64.tar.gz; then
         log_error "下载 sing-box 失败"
         exit 1
     fi
