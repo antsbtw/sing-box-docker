@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# sing-box Docker管理系统 一键安装脚本 (纯文本版)
-# 适用于 Debian/Ubuntu 系统
-# 完全兼容所有终端，无颜色，无特殊字符
+# sing-box Docker Management System - One-Click Installation Script
+# Compatible with Debian/Ubuntu systems
+# Pure ASCII characters for maximum terminal compatibility
 
 set -e
 
-# 全局变量
+# Global variables
 INSTALL_DIR="$HOME/sing-box-docker"
 
-# 纯文本日志函数
+# Pure ASCII logging functions
 log_info() {
     echo "[INFO] $1"
 }
@@ -26,275 +26,275 @@ log_error() {
     echo "[ERROR] $1"
 }
 
-# 检查是否为root用户
+# Check if running as root user
 check_root() {
     if [[ $EUID -eq 0 ]]; then
-        log_error "请不要使用root用户运行此脚本"
+        log_error "Please do not run this script as root user"
         exit 1
     fi
 }
 
-# 检查系统类型
+# Check system type
 check_system() {
     if [[ ! -f /etc/debian_version ]]; then
-        log_error "此脚本仅支持 Debian/Ubuntu 系统"
+        log_error "This script only supports Debian/Ubuntu systems"
         exit 1
     fi
-    log_success "系统检查通过"
+    log_success "System check passed"
 }
 
-# 安装依赖包
+# Install dependencies
 install_dependencies() {
-    log_info "更新系统包列表..."
+    log_info "Updating system package list..."
     sudo apt update -qq >/dev/null 2>&1
 
-    log_info "安装必要依赖..."
+    log_info "Installing required dependencies..."
     sudo apt install -y curl wget openssl netcat-openbsd lsb-release >/dev/null 2>&1
 
-    log_success "依赖包安装完成"
+    log_success "Dependencies installation completed"
 }
 
-# 清理旧安装
+# Clean up old installations
 cleanup_old_installation() {
-    log_info "清理旧版本..."
+    log_info "Cleaning up old installations..."
     
-    # 停止现有进程
+    # Stop existing processes
     sudo pkill sing-box >/dev/null 2>&1 || true
     pkill sing-box-manager >/dev/null 2>&1 || true
     sleep 2
     
-    # 备份旧目录
+    # Backup old directory
     if [[ -d "$INSTALL_DIR" ]]; then
-        log_warning "发现旧安装，将创建备份"
+        log_warning "Found existing installation, creating backup"
         mv "$INSTALL_DIR" "${INSTALL_DIR}.backup.$(date +%Y%m%d_%H%M%S)"
     fi
     
-    # 删除系统中的sing-box
+    # Remove sing-box from system
     sudo rm -f /usr/local/bin/sing-box
     
-    log_success "旧版本清理完成"
+    log_success "Old installation cleanup completed"
 }
 
-# 创建项目目录
+# Setup project directories
 setup_directories() {
-    log_info "创建项目目录..."
+    log_info "Creating project directories..."
     
     mkdir -p "$INSTALL_DIR"
     mkdir -p "$INSTALL_DIR/configs"
     mkdir -p "$INSTALL_DIR/data"
     
-    log_success "目录结构创建完成: $INSTALL_DIR"
+    log_success "Directory structure created: $INSTALL_DIR"
 }
 
-# 下载程序组件
+# Download program components
 download_components() {
-    log_info "下载组件到: $INSTALL_DIR"
+    log_info "Downloading components to: $INSTALL_DIR"
     
-    # 确保在正确目录
+    # Ensure we are in correct directory
     cd "$INSTALL_DIR"
     
-    # 下载管理程序
-    log_info "下载 sing-box 管理程序..."
+    # Download management program
+    log_info "Downloading sing-box management program..."
     if ! wget -q -O sing-box-manager-linux https://github.com/antsbtw/sing-box-docker/raw/main/sing-box-manager-linux; then
-        log_error "下载管理程序失败"
+        log_error "Failed to download management program"
         exit 1
     fi
     chmod +x sing-box-manager-linux
     
-    # 验证下载
+    # Verify download
     if [[ ! -f "sing-box-manager-linux" ]]; then
-        log_error "管理程序文件不存在"
+        log_error "Management program file does not exist"
         exit 1
     fi
     
-    log_info "下载 sing-box 核心程序..."
+    log_info "Downloading sing-box core program..."
     if ! wget -q -O sing-box.tar.gz https://github.com/SagerNet/sing-box/releases/download/v1.8.10/sing-box-1.8.10-linux-amd64.tar.gz; then
-        log_error "下载 sing-box 失败"
+        log_error "Failed to download sing-box"
         exit 1
     fi
     
-    # 解压并安装sing-box
+    # Extract and install sing-box
     tar -xzf sing-box.tar.gz >/dev/null 2>&1
     sudo mv sing-box-*/sing-box /usr/local/bin/
     rm -rf sing-box.tar.gz sing-box-1.8.10-linux-amd64
     
-    # 验证安装
+    # Verify installation
     if ! command -v sing-box &> /dev/null; then
-        log_error "sing-box 安装失败"
+        log_error "sing-box installation failed"
         exit 1
     fi
     
-    log_success "程序组件下载完成"
+    log_success "Program components download completed"
 }
 
-# 创建配置文件
+# Setup configuration files
 setup_configs() {
-    log_info "创建配置文件..."
+    log_info "Creating configuration files..."
     
-    # 确保在正确目录
+    # Ensure we are in correct directory
     cd "$INSTALL_DIR"
     
-    # 创建用户数据文件
+    # Create user data file
     cat > data/users.json << 'EOF'
 {
   "users": []
 }
 EOF
     
-    # 生成SSL证书
-    log_info "生成SSL证书..."
+    # Generate SSL certificates
+    log_info "Generating SSL certificates..."
     openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout configs/key.pem \
         -out configs/cert.pem \
         -subj "/C=US/ST=State/L=City/O=Organization/CN=example.com" \
         >/dev/null 2>&1
     
-    log_success "配置文件创建完成"
+    log_success "Configuration files creation completed"
 }
 
-# 启动服务
+# Start services
 start_services() {
-    log_info "启动服务..."
+    log_info "Starting services..."
     
-    # 确保在正确目录
+    # Ensure we are in correct directory
     cd "$INSTALL_DIR"
     
-    # 验证文件存在
+    # Verify file exists
     if [[ ! -f "sing-box-manager-linux" ]]; then
-        log_error "管理程序文件不存在"
+        log_error "Management program file does not exist"
         exit 1
     fi
     
-    # 启动管理程序
-    log_info "启动管理程序..."
+    # Start management program
+    log_info "Starting management program..."
     ./sing-box-manager-linux > manager.log 2>&1 &
     MANAGER_PID=$!
     
-    # 等待启动
-    log_info "等待管理程序启动..."
+    # Wait for startup
+    log_info "Waiting for management program to start..."
     sleep 10
     
-    # 检查进程是否还在运行
+    # Check if process is still running
     if ! kill -0 $MANAGER_PID 2>/dev/null; then
-        log_error "管理程序启动失败"
+        log_error "Management program startup failed"
         exit 1
     fi
     
-    # 检查API是否响应
+    # Check if API is responding
     local retries=5
     while [[ $retries -gt 0 ]]; do
         if curl -s http://localhost:8080/health >/dev/null 2>&1; then
             break
         fi
-        log_info "等待API服务启动..."
+        log_info "Waiting for API service to start..."
         sleep 3
         ((retries--))
     done
     
     if [[ $retries -eq 0 ]]; then
-        log_error "管理程序API启动失败"
+        log_error "Management program API startup failed"
         exit 1
     fi
     
-    log_success "管理程序启动成功"
+    log_success "Management program started successfully"
     
-    # 生成配置
-    log_info "生成sing-box配置..."
+    # Generate configuration
+    log_info "Generating sing-box configuration..."
     if ! curl -s -X POST http://localhost:8080/api/config/generate >/dev/null; then
-        log_error "配置生成失败"
+        log_error "Configuration generation failed"
         exit 1
     fi
     
-    # 验证配置
+    # Verify configuration
     if ! sing-box check -c configs/sing-box.json >/dev/null 2>&1; then
-        log_error "配置验证失败"
+        log_error "Configuration verification failed"
         exit 1
     fi
     
-    log_success "配置生成并验证完成"
+    log_success "Configuration generated and verified successfully"
     
-    # 启动sing-box
-    log_info "启动代理服务..."
+    # Start sing-box
+    log_info "Starting proxy service..."
     sudo sing-box run -c configs/sing-box.json > singbox.log 2>&1 &
     SINGBOX_PID=$!
     
-    # 等待启动
+    # Wait for startup
     sleep 5
     
-    # 检查sing-box是否启动成功
+    # Check if sing-box started successfully
     if ! sudo kill -0 $SINGBOX_PID 2>/dev/null; then
-        log_error "代理服务启动失败"
+        log_error "Proxy service startup failed"
         exit 1
     fi
     
-    log_success "代理服务启动成功"
+    log_success "Proxy service started successfully"
 }
 
-# 验证安装
+# Verify installation
 verify_installation() {
-    log_info "验证安装..."
+    log_info "Verifying installation..."
     
     cd "$INSTALL_DIR"
     
-    # 检查端口
+    # Check ports
     local ports=(443 8443 4433 1080 8080)
     local success_count=0
     
     for port in "${ports[@]}"; do
         if timeout 3 nc -z localhost $port >/dev/null 2>&1; then
-            log_success "端口 $port: 可用"
+            log_success "Port $port: Available"
             ((success_count++))
         else
-            log_warning "端口 $port: 不可用"
+            log_warning "Port $port: Unavailable"
         fi
     done
     
-    # 检查API
+    # Check API
     if curl -s http://localhost:8080/health | grep -q "ok"; then
-        log_success "管理API: 正常"
+        log_success "Management API: Normal"
     else
-        log_error "管理API: 异常"
+        log_error "Management API: Abnormal"
         return 1
     fi
     
-    log_success "验证完成，$success_count 个端口可用"
+    log_success "Verification completed, $success_count ports available"
     return 0
 }
 
-# 显示安装结果
+# Show installation results
 show_results() {
     local server_ip
     server_ip=$(hostname -I | awk '{print $1}' 2>/dev/null || echo "localhost")
     
     echo ""
     echo "================================================"
-    echo "   sing-box 管理系统安装完成"
+    echo "   sing-box Management System Installed"
     echo "================================================"
     echo ""
-    echo "服务信息:"
-    echo "  管理面板: http://${server_ip}:8080"
-    echo "  项目目录: $INSTALL_DIR"
+    echo "Service Information:"
+    echo "  Management Panel: http://${server_ip}:8080"
+    echo "  Project Directory: $INSTALL_DIR"
     echo ""
-    echo "代理协议:"
-    echo "  Trojan (端口 443)  - 高性能加密代理"
-    echo "  VLESS  (端口 8443) - 轻量级协议" 
-    echo "  Reality (端口 4433) - 最先进抗封锁技术"
-    echo "  Mixed   (端口 1080) - 本地代理支持"
+    echo "Proxy Protocols:"
+    echo "  Trojan (Port 443)  - High-performance encrypted proxy"
+    echo "  VLESS  (Port 8443) - Lightweight protocol" 
+    echo "  Reality (Port 4433) - Advanced anti-censorship technology"
+    echo "  Mixed   (Port 1080) - Local proxy support"
     echo ""
-    echo "常用命令:"
-    echo "  查看用户: curl http://localhost:8080/api/users"
-    echo "  查看进程: ps aux | grep sing-box"
-    echo "  查看日志: cd $INSTALL_DIR && tail -f manager.log"
+    echo "Common Commands:"
+    echo "  View users: curl http://localhost:8080/api/users"
+    echo "  View processes: ps aux | grep sing-box"
+    echo "  View logs: cd $INSTALL_DIR && tail -f manager.log"
     echo ""
-    echo "GitHub: https://github.com/antsbtw/sing-box-docker"
+    echo "Documentation: https://github.com/antsbtw/sing-box-docker"
     echo "================================================"
     echo ""
 }
 
-# 主函数
+# Main function
 main() {
-    echo "sing-box Docker管理系统 一键安装脚本"
-    echo "适用于 Debian/Ubuntu 系统"
+    echo "sing-box Docker Management System - One-Click Installation"
+    echo "Compatible with Debian/Ubuntu systems"
     echo ""
     
     check_root
@@ -308,13 +308,13 @@ main() {
     
     if verify_installation; then
         show_results
-        log_success "安装成功完成!"
+        log_success "Installation completed successfully!"
         exit 0
     else
-        log_error "安装验证失败"
+        log_error "Installation verification failed"
         exit 1
     fi
 }
 
-# 执行主函数
+# Execute main function
 main "$@"
