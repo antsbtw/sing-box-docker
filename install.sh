@@ -22,10 +22,14 @@ NODE_API_KEY=""
 NODE_ID="node-$(hostname)"
 VLESS_PORT=443
 
+# 默认值
+API_URL="https://otun-manager.situstechnologies.com"
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --api-key) NODE_API_KEY="$2"; shift 2 ;;
         --node-id) NODE_ID="$2"; shift 2 ;;
+        --api-url) API_URL="$2"; shift 2 ;;
         --vless-port) VLESS_PORT="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -105,6 +109,7 @@ WorkingDirectory=$INSTALL_DIR
 Environment="NODE_API_KEY=$NODE_API_KEY"
 Environment="NODE_ID=$NODE_ID"
 Environment="VLESS_PORT=$VLESS_PORT"
+Environment="OTUN_API_URL=$API_URL"
 ExecStart=$INSTALL_DIR/agent
 Restart=always
 RestartSec=5
