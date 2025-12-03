@@ -17,6 +17,19 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# 清理已有环境
+echo -e "${YELLOW}Cleaning up existing installation...${NC}"
+systemctl stop otun-agent 2>/dev/null || true
+systemctl disable otun-agent 2>/dev/null || true
+pkill -9 sing-box 2>/dev/null || true
+pkill -9 agent 2>/dev/null || true
+sleep 2
+
+# 安装必要依赖
+echo -e "${GREEN}Installing dependencies...${NC}"
+apt-get update -qq
+apt-get install -y -qq git curl
+
 # 解析参数
 NODE_API_KEY=""
 NODE_ID="node-$(hostname)"
