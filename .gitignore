@@ -4,7 +4,7 @@ bin/
 
 # Data and cache
 data/
-singbox/
+/singbox/
 
 # IDE
 .idea/
