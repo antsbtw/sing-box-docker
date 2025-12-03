@@ -11,11 +11,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/situstechnologies/otun-node-agent/internal/api"
-	"github.com/situstechnologies/otun-node-agent/internal/config"
-	"github.com/situstechnologies/otun-node-agent/internal/quota"
-	"github.com/situstechnologies/otun-node-agent/internal/singbox"
-	"github.com/situstechnologies/otun-node-agent/internal/stats"
+	"otun-node-agent/internal/api"
+	"otun-node-agent/internal/config"
+	"otun-node-agent/internal/quota"
+	"otun-node-agent/internal/singbox"
+	"otun-node-agent/internal/stats"
 )
 
 // Agent 是主控制器

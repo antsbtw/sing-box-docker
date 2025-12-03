@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/situstechnologies/otun-node-agent/internal/config"
+	"otun-node-agent/internal/config"
 )
 
 func testGenerator() {

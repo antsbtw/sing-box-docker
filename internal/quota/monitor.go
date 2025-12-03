@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/situstechnologies/otun-node-agent/internal/config"
+	"otun-node-agent/internal/config"
 )
 
 // UserQuota 存储用户限额信息
