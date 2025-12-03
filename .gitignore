@@ -1,0 +1,18 @@
+# Binaries
+bin/
+*.exe
+
+# Data and cache
+data/
+singbox/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Environment
+.env
+
+# OS files
+.DS_Store

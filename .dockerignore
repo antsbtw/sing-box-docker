@@ -1,0 +1,27 @@
+# Binaries
+bin/
+*.exe
+
+# Data and cache
+data/
+singbox/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Docker
+docker-compose*.yml
+.env*
+
+# Test files
+*_test.go
+test_*.sh
+
+# Docs
+*.md

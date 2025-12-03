@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  otun-agent:
+    build: .
+    image: otun-node-agent:latest
+    container_name: otun-agent
+    restart: unless-stopped
+    
+    # 网络模式：host 以获得最佳性能
+    network_mode: host
+    
+    # 或使用端口映射（如果不用 host 模式）
+    # ports:
+    #   - "443:443/tcp"
+    #   - "443:443/udp"
+    #   - "8388:8388/tcp"
+    #   - "8388:8388/udp"
+    #   - "8080:8080/tcp"
+    
+    environment:
+      - OTUN_API_URL=${OTUN_API_URL:-https://saasapi.situstechnologies.com}
+      - NODE_API_KEY=${NODE_API_KEY}
+      - NODE_ID=${NODE_ID:-node-default}
+      - SYNC_INTERVAL=${SYNC_INTERVAL:-60}
+      - STATS_INTERVAL=${STATS_INTERVAL:-300}
+      - VLESS_PORT=${VLESS_PORT:-443}
+      - SS_PORT=${SS_PORT:-8388}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    
+    volumes:
+      # 持久化数据（密钥、缓存等）
+      - ./data:/app/data
+      # sing-box 配置
+      - ./singbox:/etc/sing-box
+    
+    # 安全设置
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

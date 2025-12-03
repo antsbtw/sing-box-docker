@@ -1,0 +1,70 @@
+{
+  "experimental": {
+    "v2ray_api": {
+      "listen": "127.0.0.1:10085",
+      "stats": {
+        "enabled": true,
+        "users": [
+          "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+          "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+        ]
+      }
+    }
+  },
+  "inbounds": [
+    {
+      "listen": "::",
+      "listen_port": 443,
+      "tag": "vless-in",
+      "tls": {
+        "enabled": true,
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "UuMBgl7MXTPx9inmQp2bPGC6F3TCPnOV5Fy5OYsTGic",
+          "short_id": [
+            "0123456789abcdef"
+          ]
+        },
+        "server_name": "www.microsoft.com"
+      },
+      "type": "vless",
+      "users": [
+        {
+          "flow": "xtls-rprx-vision",
+          "uuid": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        },
+        {
+          "flow": "xtls-rprx-vision",
+          "uuid": "b2c3d4e5-f6a7-8901-bcde-f12345678901"
+        }
+      ]
+    },
+    {
+      "listen": "::",
+      "listen_port": 8388,
+      "method": "chacha20-ietf-poly1305",
+      "tag": "ss-in",
+      "type": "shadowsocks",
+      "users": [
+        {
+          "name": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+          "password": "test_password_123"
+        }
+      ]
+    }
+  ],
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "outbounds": [
+    {
+      "tag": "direct",
+      "type": "direct"
+    }
+  ]
+}
