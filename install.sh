@@ -83,16 +83,16 @@ mkdir -p $INSTALL_DIR
 cd $INSTALL_DIR
 
 # 安装 Go (用于编译 sing-box 和 agent)
-if ! command -v go &> /dev/null; then
-    echo -e "${GREEN}Installing Go...${NC}"
-    curl -fsSL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -o go.tar.gz
-    rm -rf /usr/local/go
-    tar -C /usr/local -xzf go.tar.gz
-    rm go.tar.gz
-    export PATH=$PATH:/usr/local/go/bin
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-fi
+# sing-box 1.12+ 需要 Go 1.23+
+GO_VERSION="1.23.4"
+echo -e "${GREEN}Installing Go ${GO_VERSION}...${NC}"
+rm -rf /usr/local/go
+curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o go.tar.gz
+tar -C /usr/local -xzf go.tar.gz
+rm go.tar.gz
 export PATH=$PATH:/usr/local/go/bin
+grep -q '/usr/local/go/bin' /etc/profile || echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
+echo -e "${GREEN}Go installed: $(go version)${NC}"
 
 # 从源码编译 sing-box (启用 v2ray_api 支持流量统计)
 echo -e "${GREEN}Building sing-box from source with v2ray_api support...${NC}"
