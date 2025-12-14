@@ -99,27 +99,26 @@ func (m *Manager) Stop() error {
 	return nil
 }
 
-// Reload 重载配置（发送 SIGHUP 或重启）
+// Reload 重载配置（重启 sing-box 进程）
 func (m *Manager) Reload() error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if !m.running || m.cmd == nil || m.cmd.Process == nil {
+	// 检查是否运行中（不持有锁，因为 Stop/Start 会自己加锁）
+	if !m.IsRunning() {
 		return fmt.Errorf("sing-box is not running")
 	}
 
 	log.Println("Reloading sing-box config...")
 
 	// sing-box 不支持 SIGHUP，需要重启
-	// 先解锁，调用 Stop 和 Start
-	m.mu.Unlock()
+	// Stop 和 Start 各自会处理锁，这里不能持有锁
 	if err := m.Stop(); err != nil {
-		m.mu.Lock()
-		return err
+		return fmt.Errorf("stop sing-box for reload: %w", err)
 	}
-	err := m.Start()
-	m.mu.Lock()
-	return err
+
+	if err := m.Start(); err != nil {
+		return fmt.Errorf("start sing-box after reload: %w", err)
+	}
+
+	return nil
 }
 
 // IsRunning 检查是否运行中
