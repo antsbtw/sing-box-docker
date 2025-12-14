@@ -111,8 +111,11 @@ rm -rf sing-box-src
 git clone --depth 1 --branch "v${SINGBOX_VERSION}" https://github.com/SagerNet/sing-box.git sing-box-src
 cd sing-box-src
 
-# 使用 with_v2ray_api tag 编译，启用流量统计功能
-go build -tags "with_v2ray_api" -o sing-box ./cmd/sing-box
+# 使用多个 tags 编译，启用所需功能：
+# - with_v2ray_api: 流量统计
+# - with_utls: Reality 协议所需的 uTLS
+# - with_reality_server: Reality 服务端支持
+go build -tags "with_v2ray_api,with_utls,with_reality_server" -o sing-box ./cmd/sing-box
 
 # 安装编译好的 sing-box
 mv sing-box /usr/local/bin/
