@@ -23,8 +23,8 @@ func NewHealthServer(isHealthy func() bool) *HealthServer {
 // Start 启动健康检查 HTTP 服务
 func (s *HealthServer) Start(addr string) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/ready", s.handleReady)
+	mux.HandleFunc("/health", s.HandleHealth)
+	mux.HandleFunc("/ready", s.HandleReady)
 
 	server := &http.Server{
 		Addr:         addr,
@@ -36,7 +36,8 @@ func (s *HealthServer) Start(addr string) error {
 	return server.ListenAndServe()
 }
 
-func (s *HealthServer) handleHealth(w http.ResponseWriter, r *http.Request) {
+// HandleHealth 处理健康检查请求
+func (s *HealthServer) HandleHealth(w http.ResponseWriter, r *http.Request) {
 	status := "healthy"
 	code := http.StatusOK
 
@@ -50,11 +51,12 @@ func (s *HealthServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"status":  status,
 		"uptime":  time.Since(s.startTime).String(),
-		"version": "1.0.0",
+		"version": "1.1.0",
 	})
 }
 
-func (s *HealthServer) handleReady(w http.ResponseWriter, r *http.Request) {
+// HandleReady 处理就绪检查请求
+func (s *HealthServer) HandleReady(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("OK"))
 }

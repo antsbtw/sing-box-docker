@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"otun-node-agent/internal/api"
 	"otun-node-agent/internal/config"
+	"otun-node-agent/internal/local"
 	"otun-node-agent/internal/quota"
 	"otun-node-agent/internal/singbox"
 	"otun-node-agent/internal/stats"
@@ -31,13 +33,17 @@ type Agent struct {
 	collector  *stats.Collector
 	reporter   *stats.Reporter
 
+	// 本地用户管理
+	localStore *local.Store
+	localAPI   *api.LocalAPIServer
+
 	currentVersion string
 	mu             sync.RWMutex
 }
 
 func main() {
 	log.Println("========================================")
-	log.Println("  OTun Node Agent v1.0.0")
+	log.Println("  OTun Node Agent v1.1.0")
 	log.Println("========================================")
 
 	// 加载配置
@@ -47,7 +53,12 @@ func main() {
 	}
 
 	log.Printf("Node ID: %s", cfg.NodeID)
-	log.Printf("API URL: %s", cfg.APIURL)
+	log.Printf("Management Mode: %s", cfg.ManagementMode)
+
+	// 只在远程/混合模式下显示 API URL
+	if cfg.ManagementMode == config.ModeRemote || cfg.ManagementMode == config.ModeHybrid {
+		log.Printf("API URL: %s", cfg.APIURL)
+	}
 
 	// 初始化 Agent
 	agent, err := NewAgent(cfg)
@@ -132,22 +143,116 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		}
 	})
 
+	// 本地/混合模式：初始化本地用户存储
+	if cfg.ManagementMode == config.ModeLocal || cfg.ManagementMode == config.ModeHybrid {
+		agent.localStore = local.NewStore(dataDir, func() {
+			// 用户变更回调：重新生成配置
+			log.Println("Local users changed, regenerating config...")
+			agent.regenerateConfig()
+		})
+
+		// 创建本地 API 服务
+		nodeConfig := &api.NodeConfig{
+			NodeID:    cfg.NodeID,
+			ServerIP:  cfg.ServerIP,
+			PublicKey: secrets.PublicKey,
+			ShortID:   secrets.ShortIDs[0],
+			VLESSPort: cfg.VLESSPort,
+			SSPort:    ssPort,
+			SSMethod:  "chacha20-ietf-poly1305",
+		}
+		agent.localAPI = api.NewLocalAPIServer(agent.localStore, cfg.NodeAPIKey, nodeConfig)
+
+		log.Printf("Local management API enabled")
+		if cfg.ServerIP != "" {
+			log.Printf("Server IP: %s", cfg.ServerIP)
+		} else {
+			log.Printf("Warning: SERVER_IP not set, connection URLs will be incomplete")
+		}
+	}
+
 	return agent, nil
 }
 
 // Run 启动 Agent 主循环
 func (a *Agent) Run(ctx context.Context) {
-	// 启动健康检查服务
+	// 启动 HTTP 服务（健康检查 + 本地 API）
+	a.startHTTPServer()
+
+	// 根据管理模式执行不同的初始化
+	switch a.cfg.ManagementMode {
+	case config.ModeLocal:
+		// 本地模式：只使用本地用户
+		log.Println("Running in LOCAL mode")
+		a.initLocalMode()
+
+	case config.ModeRemote:
+		// 远程模式：与原来行为一致
+		log.Println("Running in REMOTE mode")
+		a.initRemoteMode()
+
+	case config.ModeHybrid:
+		// 混合模式：本地 + 远程
+		log.Println("Running in HYBRID mode")
+		a.initHybridMode()
+	}
+
+	// 启动 sing-box
+	if os.Getenv("SKIP_SINGBOX") != "true" {
+		if err := a.manager.Start(); err != nil {
+			log.Printf("Failed to start sing-box: %v", err)
+		}
+	} else {
+		log.Println("SKIP_SINGBOX=true, skipping sing-box start")
+	}
+
+	// 启动主循环
+	a.runMainLoop(ctx)
+}
+
+// startHTTPServer 启动 HTTP 服务
+func (a *Agent) startHTTPServer() {
+	mux := http.NewServeMux()
+
+	// 健康检查
 	healthServer := api.NewHealthServer(func() bool {
 		return a.manager.IsRunning() || os.Getenv("SKIP_SINGBOX") == "true"
 	})
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		healthServer.HandleHealth(w, r)
+	})
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		healthServer.HandleReady(w, r)
+	})
+
+	// 注册本地 API 路由（如果启用）
+	if a.localAPI != nil {
+		a.localAPI.RegisterRoutes(mux)
+		log.Println("Local API routes registered")
+	}
+
 	go func() {
-		log.Println("Health server starting on :8080")
-		if err := healthServer.Start(":8080"); err != nil {
-			log.Printf("Health server error: %v", err)
+		log.Println("HTTP server starting on :8080")
+		server := &http.Server{
+			Addr:         ":8080",
+			Handler:      mux,
+			ReadTimeout:  30 * time.Second,
+			WriteTimeout: 30 * time.Second,
+		}
+		if err := server.ListenAndServe(); err != nil {
+			log.Printf("HTTP server error: %v", err)
 		}
 	}()
+}
 
+// initLocalMode 初始化本地模式
+func (a *Agent) initLocalMode() {
+	// 从本地用户生成配置
+	a.regenerateConfig()
+}
+
+// initRemoteMode 初始化远程模式
+func (a *Agent) initRemoteMode() {
 	// 节点注册
 	if err := a.register(); err != nil {
 		log.Printf("Node registration failed: %v", err)
@@ -164,62 +269,210 @@ func (a *Agent) Run(ctx context.Context) {
 		}
 	}
 
-	// 启动 sing-box
-	if os.Getenv("SKIP_SINGBOX") != "true" {
-		if err := a.manager.Start(); err != nil {
-			log.Printf("Failed to start sing-box: %v", err)
-		}
-	} else {
-		log.Println("SKIP_SINGBOX=true, skipping sing-box start")
+	// 尝试上报缓存的统计
+	if err := a.reporter.FlushCache(); err != nil {
+		log.Printf("Failed to flush stats cache: %v", err)
+	}
+}
+
+// initHybridMode 初始化混合模式
+func (a *Agent) initHybridMode() {
+	// 节点注册
+	if err := a.register(); err != nil {
+		log.Printf("Node registration failed: %v", err)
+	}
+
+	// 同步远程用户并合并本地用户
+	if err := a.syncAndApplyHybrid(); err != nil {
+		log.Printf("Initial sync failed: %v", err)
+		// 回退到本地用户
+		a.regenerateConfig()
 	}
 
 	// 尝试上报缓存的统计
 	if err := a.reporter.FlushCache(); err != nil {
 		log.Printf("Failed to flush stats cache: %v", err)
 	}
+}
 
-	// 定时器
-	syncTicker := time.NewTicker(a.cfg.SyncInterval)           // 60s - 用户列表同步
-	statsTicker := time.NewTicker(a.cfg.StatsInterval)         // 5min - 流量统计上报
-	heartbeatTicker := time.NewTicker(30 * time.Second)        // 30s - 心跳
-	connectionsTicker := time.NewTicker(10 * time.Second)      // 10s - 连接上报
-	quotaTicker := time.NewTicker(10 * time.Second)            // 10s - 过期检查
+// runMainLoop 主循环
+func (a *Agent) runMainLoop(ctx context.Context) {
+	// 根据模式决定是否启用远程同步定时器
+	var syncTicker *time.Ticker
+	var statsTicker *time.Ticker
+	var heartbeatTicker *time.Ticker
+	var connectionsTicker *time.Ticker
 
-	defer syncTicker.Stop()
-	defer statsTicker.Stop()
-	defer heartbeatTicker.Stop()
-	defer connectionsTicker.Stop()
+	if a.cfg.ManagementMode == config.ModeRemote || a.cfg.ManagementMode == config.ModeHybrid {
+		syncTicker = time.NewTicker(a.cfg.SyncInterval)
+		statsTicker = time.NewTicker(a.cfg.StatsInterval)
+		heartbeatTicker = time.NewTicker(30 * time.Second)
+		connectionsTicker = time.NewTicker(10 * time.Second)
+		defer syncTicker.Stop()
+		defer statsTicker.Stop()
+		defer heartbeatTicker.Stop()
+		defer connectionsTicker.Stop()
+	}
+
+	quotaTicker := time.NewTicker(10 * time.Second)
 	defer quotaTicker.Stop()
 
-	log.Printf("Agent is running (sync: %v, stats: %v)",
-		a.cfg.SyncInterval, a.cfg.StatsInterval)
+	log.Printf("Agent is running (mode: %s)", a.cfg.ManagementMode)
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Println("Stopping agent...")
-			a.collectAndReport()
+			if a.cfg.ManagementMode != config.ModeLocal {
+				a.collectAndReport()
+			}
 			a.manager.Stop()
 			return
 
-		case <-syncTicker.C:
-			if err := a.syncAndApply(); err != nil {
-				log.Printf("Sync error: %v", err)
-			}
-
-		case <-statsTicker.C:
-			a.collectAndReport()
-
-		case <-heartbeatTicker.C:
-			a.sendHeartbeat()
-
-		case <-connectionsTicker.C:
-			a.reportConnections()
-
 		case <-quotaTicker.C:
 			a.monitor.CheckAllUsers()
+
+		default:
+			// 远程/混合模式的定时任务
+			if syncTicker != nil {
+				select {
+				case <-syncTicker.C:
+					if a.cfg.ManagementMode == config.ModeHybrid {
+						if err := a.syncAndApplyHybrid(); err != nil {
+							log.Printf("Sync error: %v", err)
+						}
+					} else {
+						if err := a.syncAndApply(); err != nil {
+							log.Printf("Sync error: %v", err)
+						}
+					}
+				case <-statsTicker.C:
+					a.collectAndReport()
+				case <-heartbeatTicker.C:
+					a.sendHeartbeat()
+				case <-connectionsTicker.C:
+					a.reportConnections()
+				default:
+				}
+			}
+
+			// 小睡一下避免 CPU 空转
+			time.Sleep(100 * time.Millisecond)
 		}
 	}
+}
+
+// regenerateConfig 重新生成 sing-box 配置（从本地用户）
+func (a *Agent) regenerateConfig() {
+	if a.localStore == nil {
+		return
+	}
+
+	localUsers := a.localStore.ListUsers()
+	users := make([]config.User, 0, len(localUsers))
+
+	for _, lu := range localUsers {
+		users = append(users, config.User{
+			UUID:         lu.UUID,
+			Protocols:    lu.Protocols,
+			SSPassword:   lu.SSPassword,
+			Enabled:      lu.Enabled,
+			TrafficLimit: lu.TrafficLimit,
+			TrafficUsed:  lu.TrafficUsed,
+			ExpireAt:     lu.ExpireAt,
+		})
+	}
+
+	log.Printf("Regenerating config with %d local users", len(users))
+
+	// 更新限额监控
+	a.monitor.UpdateUsers(users)
+
+	// 生成配置
+	singboxCfg := a.generator.Generate(users, "www.microsoft.com")
+
+	if err := a.generator.WriteToFile(singboxCfg, a.cfg.SingboxConfig); err != nil {
+		log.Printf("Failed to write config: %v", err)
+		return
+	}
+
+	// 重载 sing-box
+	if a.manager.IsRunning() {
+		log.Println("Reloading sing-box...")
+		if err := a.manager.Reload(); err != nil {
+			log.Printf("Failed to reload sing-box: %v", err)
+		}
+	}
+}
+
+// syncAndApplyHybrid 混合模式：同步远程用户并合并本地用户
+func (a *Agent) syncAndApplyHybrid() error {
+	log.Println("Syncing configuration (hybrid mode)...")
+
+	// 获取远程用户
+	resp, err := a.syncer.FetchUsers()
+	if err != nil {
+		return err
+	}
+
+	// 获取本地用户
+	localUsers := a.localStore.ListUsers()
+
+	// 合并用户列表（本地优先级更高）
+	userMap := make(map[string]config.User)
+
+	// 先添加远程用户
+	for _, u := range resp.Users {
+		userMap[u.UUID] = u
+	}
+
+	// 再添加本地用户（覆盖同 UUID 的远程用户）
+	for _, lu := range localUsers {
+		userMap[lu.UUID] = config.User{
+			UUID:         lu.UUID,
+			Protocols:    lu.Protocols,
+			SSPassword:   lu.SSPassword,
+			Enabled:      lu.Enabled,
+			TrafficLimit: lu.TrafficLimit,
+			TrafficUsed:  lu.TrafficUsed,
+			ExpireAt:     lu.ExpireAt,
+		}
+	}
+
+	// 转换为列表
+	users := make([]config.User, 0, len(userMap))
+	for _, u := range userMap {
+		users = append(users, u)
+	}
+
+	log.Printf("Merged users: %d remote + %d local = %d total",
+		len(resp.Users), len(localUsers), len(users))
+
+	// 更新限额监控
+	a.monitor.UpdateUsers(users)
+
+	// 缓存远程用户
+	if err := a.cache.SaveUsers(resp); err != nil {
+		log.Printf("Failed to cache users: %v", err)
+	}
+
+	// 生成配置
+	singboxCfg := a.generator.Generate(users, resp.Config.RealitySNI)
+
+	if err := a.generator.WriteToFile(singboxCfg, a.cfg.SingboxConfig); err != nil {
+		return err
+	}
+
+	a.mu.Lock()
+	a.currentVersion = resp.Version
+	a.mu.Unlock()
+
+	if a.manager.IsRunning() {
+		log.Println("Reloading sing-box...")
+		return a.manager.Reload()
+	}
+
+	return nil
 }
 
 // register 向管理服务器注册
@@ -266,7 +519,11 @@ func (a *Agent) sendHeartbeat() {
 	// 检查是否需要重新加载用户
 	if resp.ReloadUsers {
 		log.Println("Manager requested user reload")
-		a.syncAndApply()
+		if a.cfg.ManagementMode == config.ModeHybrid {
+			a.syncAndApplyHybrid()
+		} else {
+			a.syncAndApply()
+		}
 	}
 }
 

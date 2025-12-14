@@ -2,18 +2,32 @@ package config
 
 import "time"
 
+// ManagementMode 管理模式
+type ManagementMode string
+
+const (
+	// ModeLocal 本地管理模式：只使用本地 API 管理用户
+	ModeLocal ManagementMode = "local"
+	// ModeRemote 远程管理模式：从上游服务器同步用户
+	ModeRemote ManagementMode = "remote"
+	// ModeHybrid 混合模式：本地 + 远程用户合并
+	ModeHybrid ManagementMode = "hybrid"
+)
+
 // AgentConfig 是 Agent 的运行配置
 type AgentConfig struct {
-	APIURL        string
-	NodeAPIKey    string
-	NodeID        string
-	SyncInterval  time.Duration
-	StatsInterval time.Duration
-	VLESSPort     int
-	SSPort        int
-	SingboxBin    string
-	SingboxConfig string
-	LogLevel      string
+	APIURL         string
+	NodeAPIKey     string
+	NodeID         string
+	SyncInterval   time.Duration
+	StatsInterval  time.Duration
+	VLESSPort      int
+	SSPort         int
+	SingboxBin     string
+	SingboxConfig  string
+	LogLevel       string
+	ManagementMode ManagementMode // 管理模式
+	ServerIP       string         // 服务器公网 IP（用于生成连接 URL）
 }
 
 // User 是从管理服务器获取的用户信息
