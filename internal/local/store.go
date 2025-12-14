@@ -79,14 +79,14 @@ func (s *Store) load() error {
 	return nil
 }
 
-// save 保存用户到文件
+// save 保存用户到文件（调用者必须已持有锁）
 func (s *Store) save() error {
-	s.mu.RLock()
+	// 注意：此方法假设调用者已经持有锁（Lock 或 RLock）
+	// 不要在这里再获取锁，否则会死锁
 	users := make([]LocalUser, 0, len(s.users))
 	for _, u := range s.users {
 		users = append(users, *u)
 	}
-	s.mu.RUnlock()
 
 	data := LocalUsersData{
 		Version: fmt.Sprintf("%d", time.Now().UnixNano()),
