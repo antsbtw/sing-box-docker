@@ -125,7 +125,7 @@ if ! curl -fsSL "$SINGBOX_URL" -o /usr/local/bin/sing-box; then
     rm -rf sing-box-src
     git clone --depth 1 --branch "v${SINGBOX_VERSION}" https://github.com/SagerNet/sing-box.git sing-box-src
     cd sing-box-src
-    if ! go build -tags "with_v2ray_api,with_utls" -o sing-box ./cmd/sing-box; then
+    if ! go build -tags "with_v2ray_api,with_utls,with_reality_server" -o sing-box ./cmd/sing-box; then
         echo -e "${RED}Failed to build sing-box${NC}"
         cd /tmp && rm -rf sing-box-src
         exit 1

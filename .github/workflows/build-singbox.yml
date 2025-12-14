@@ -45,7 +45,7 @@ jobs:
         run: |
           cd sing-box-src
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -tags "with_v2ray_api,with_utls" \
+            go build -tags "with_v2ray_api,with_utls,with_reality_server" \
             -ldflags "-s -w" \
             -o ../sing-box-${{ matrix.goos }}-${{ matrix.goarch }} \
             ./cmd/sing-box

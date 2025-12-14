@@ -18,7 +18,7 @@ SINGBOX_VERSION="${SINGBOX_VERSION:-1.10.7}"
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}  sing-box Binary Builder${NC}"
 echo -e "${GREEN}  Version: v${SINGBOX_VERSION}${NC}"
-echo -e "${GREEN}  Tags: with_v2ray_api,with_utls${NC}"
+echo -e "${GREEN}  Tags: with_v2ray_api,with_utls,with_reality_server${NC}"
 echo -e "${GREEN}========================================${NC}"
 
 # 检查 Go 版本
@@ -52,7 +52,7 @@ for ARCH in "${ARCHS[@]}"; do
     OUTPUT_FILE="${OUTPUT_DIR}/sing-box-linux-${ARCH}"
 
     CGO_ENABLED=0 GOOS=linux GOARCH=$ARCH \
-        go build -tags "with_v2ray_api,with_utls" \
+        go build -tags "with_v2ray_api,with_utls,with_reality_server" \
         -ldflags "-s -w" \
         -o "$OUTPUT_FILE" \
         ./cmd/sing-box
