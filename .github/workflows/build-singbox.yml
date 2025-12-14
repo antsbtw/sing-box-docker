@@ -11,6 +11,9 @@ on:
         required: true
         default: '1.10.7'
 
+permissions:
+  contents: write
+
 env:
   SINGBOX_VERSION: ${{ github.event.inputs.singbox_version || '1.10.7' }}
 
