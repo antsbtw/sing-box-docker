@@ -114,7 +114,18 @@ cd sing-box-src
 # 使用多个 tags 编译，启用所需功能：
 # - with_v2ray_api: 流量统计
 # - with_utls: Reality 协议支持 (已包含 reality_server)
-go build -tags "with_v2ray_api,with_utls" -o sing-box ./cmd/sing-box
+if ! go build -tags "with_v2ray_api,with_utls" -o sing-box ./cmd/sing-box; then
+    echo -e "${RED}Failed to build sing-box${NC}"
+    cd /tmp && rm -rf sing-box-src
+    exit 1
+fi
+
+# 检查编译产物是否存在
+if [ ! -f "sing-box" ]; then
+    echo -e "${RED}sing-box binary not found after build${NC}"
+    cd /tmp && rm -rf sing-box-src
+    exit 1
+fi
 
 # 安装编译好的 sing-box
 mv sing-box /usr/local/bin/
@@ -125,6 +136,10 @@ cd /tmp
 rm -rf sing-box-src
 
 # 验证安装
+if ! sing-box version > /dev/null 2>&1; then
+    echo -e "${RED}sing-box installation verification failed${NC}"
+    exit 1
+fi
 echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
 
 cd $INSTALL_DIR
@@ -132,7 +147,9 @@ cd $INSTALL_DIR
 # 克隆或更新代码
 echo -e "${GREEN}Downloading OTun Node Agent...${NC}"
 if [ -d "repo" ]; then
-    cd repo && git pull
+    cd repo
+    git fetch origin
+    git reset --hard origin/main
 else
     git clone https://github.com/antsbtw/sing-box-docker.git repo
     cd repo
@@ -140,7 +157,16 @@ fi
 
 # 编译 agent
 echo -e "${GREEN}Building agent...${NC}"
-go build -o $INSTALL_DIR/agent ./cmd/agent
+if ! go build -o $INSTALL_DIR/agent ./cmd/agent; then
+    echo -e "${RED}Failed to build agent${NC}"
+    exit 1
+fi
+
+if [ ! -f "$INSTALL_DIR/agent" ]; then
+    echo -e "${RED}Agent binary not found after build${NC}"
+    exit 1
+fi
+echo -e "${GREEN}Agent built successfully${NC}"
 
 # 创建数据目录
 mkdir -p $INSTALL_DIR/data
