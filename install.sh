@@ -17,13 +17,33 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# 清理已有环境
+# 彻底清理已有环境
 echo -e "${YELLOW}Cleaning up existing installation...${NC}"
+
+# 停止服务
 systemctl stop otun-agent 2>/dev/null || true
+systemctl stop sing-box 2>/dev/null || true
 systemctl disable otun-agent 2>/dev/null || true
+systemctl disable sing-box 2>/dev/null || true
+
+# 强制终止进程
 pkill -9 sing-box 2>/dev/null || true
 pkill -9 agent 2>/dev/null || true
 sleep 2
+
+# 删除旧的二进制文件
+rm -f /usr/local/bin/sing-box 2>/dev/null || true
+rm -f /opt/otun-agent/agent 2>/dev/null || true
+
+# 删除旧的配置（保留用户数据）
+rm -f /etc/sing-box/config.json 2>/dev/null || true
+
+# 删除旧的 systemd 服务文件
+rm -f /etc/systemd/system/otun-agent.service 2>/dev/null || true
+rm -f /etc/systemd/system/sing-box.service 2>/dev/null || true
+systemctl daemon-reload
+
+echo -e "${GREEN}Cleanup completed${NC}"
 
 # 安装必要依赖
 echo -e "${GREEN}Installing dependencies...${NC}"
@@ -62,17 +82,7 @@ INSTALL_DIR="/opt/otun-agent"
 mkdir -p $INSTALL_DIR
 cd $INSTALL_DIR
 
-# 下载预编译的 sing-box
-echo -e "${GREEN}Downloading sing-box...${NC}"
-SINGBOX_URL="https://github.com/antsbtw/sing-box-docker/releases/download/v1.0.0/sing-box-linux-amd64.gz"
-curl -fsSL $SINGBOX_URL -o sing-box.gz
-gunzip -f sing-box.gz
-chmod +x sing-box
-mv sing-box /usr/local/bin/
-setcap cap_net_bind_service=+ep /usr/local/bin/sing-box
-echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
-
-# 安装 Go (如果需要编译 agent)
+# 安装 Go (用于编译 sing-box 和 agent)
 if ! command -v go &> /dev/null; then
     echo -e "${GREEN}Installing Go...${NC}"
     curl -fsSL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -o go.tar.gz
@@ -83,6 +93,39 @@ if ! command -v go &> /dev/null; then
     echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
 fi
 export PATH=$PATH:/usr/local/go/bin
+
+# 从源码编译 sing-box (启用 v2ray_api 支持流量统计)
+echo -e "${GREEN}Building sing-box from source with v2ray_api support...${NC}"
+echo -e "${YELLOW}This may take a few minutes...${NC}"
+
+# 获取最新稳定版本号
+SINGBOX_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+if [ -z "$SINGBOX_VERSION" ]; then
+    SINGBOX_VERSION="1.10.0"  # 备用版本
+fi
+echo -e "${YELLOW}sing-box version: v${SINGBOX_VERSION}${NC}"
+
+# 下载并编译 sing-box
+cd /tmp
+rm -rf sing-box-src
+git clone --depth 1 --branch "v${SINGBOX_VERSION}" https://github.com/SagerNet/sing-box.git sing-box-src
+cd sing-box-src
+
+# 使用 with_v2ray_api tag 编译，启用流量统计功能
+go build -tags "with_v2ray_api" -o sing-box ./cmd/sing-box
+
+# 安装编译好的 sing-box
+mv sing-box /usr/local/bin/
+setcap cap_net_bind_service=+ep /usr/local/bin/sing-box
+
+# 清理源码
+cd /tmp
+rm -rf sing-box-src
+
+# 验证安装
+echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
+
+cd $INSTALL_DIR
 
 # 克隆或更新代码
 echo -e "${GREEN}Downloading OTun Node Agent...${NC}"
