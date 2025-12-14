@@ -82,58 +82,60 @@ INSTALL_DIR="/opt/otun-agent"
 mkdir -p $INSTALL_DIR
 cd $INSTALL_DIR
 
-# 安装 Go (用于编译 sing-box 和 agent)
-# sing-box 1.12+ 需要 Go 1.23+
+# 安装 Go (仅用于编译 agent)
 GO_VERSION="1.23.4"
 echo -e "${GREEN}Installing Go ${GO_VERSION}...${NC}"
 rm -rf /usr/local/go
-curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o go.tar.gz
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64) GO_ARCH="amd64" ;;
+    aarch64) GO_ARCH="arm64" ;;
+    *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; exit 1 ;;
+esac
+curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o go.tar.gz
 tar -C /usr/local -xzf go.tar.gz
 rm go.tar.gz
 export PATH=$PATH:/usr/local/go/bin
 grep -q '/usr/local/go/bin' /etc/profile || echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
 echo -e "${GREEN}Go installed: $(go version)${NC}"
 
-# 从源码编译 sing-box (启用 v2ray_api 支持流量统计)
-echo -e "${GREEN}Building sing-box from source with v2ray_api support...${NC}"
-echo -e "${YELLOW}This may take a few minutes...${NC}"
+# 下载预编译的 sing-box (已包含 v2ray_api 和 utls 支持)
+echo -e "${GREEN}Downloading pre-built sing-box with v2ray_api support...${NC}"
 
-# 获取最新稳定版本号
-SINGBOX_VERSION=$(curl -s https://api.github.com/repos/SagerNet/sing-box/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-if [ -z "$SINGBOX_VERSION" ]; then
-    SINGBOX_VERSION="1.10.0"  # 备用版本
-fi
-echo -e "${YELLOW}sing-box version: v${SINGBOX_VERSION}${NC}"
+# sing-box 版本和预编译二进制下载地址
+SINGBOX_VERSION="1.10.7"
 
-# 下载并编译 sing-box
-cd /tmp
-rm -rf sing-box-src
-git clone --depth 1 --branch "v${SINGBOX_VERSION}" https://github.com/SagerNet/sing-box.git sing-box-src
-cd sing-box-src
+# 确定架构
+case $ARCH in
+    x86_64) SINGBOX_ARCH="amd64" ;;
+    aarch64) SINGBOX_ARCH="arm64" ;;
+esac
 
-# 使用多个 tags 编译，启用所需功能：
-# - with_v2ray_api: 流量统计
-# - with_utls: Reality 协议支持 (已包含 reality_server)
-if ! go build -tags "with_v2ray_api,with_utls" -o sing-box ./cmd/sing-box; then
-    echo -e "${RED}Failed to build sing-box${NC}"
+# 从 GitHub Release 下载预编译二进制文件
+# 这个二进制文件由项目维护者预编译，包含 with_v2ray_api,with_utls 标签
+SINGBOX_URL="https://github.com/antsbtw/sing-box-docker/releases/download/v${SINGBOX_VERSION}/sing-box-linux-${SINGBOX_ARCH}"
+
+echo -e "${YELLOW}Downloading sing-box v${SINGBOX_VERSION} for ${SINGBOX_ARCH}...${NC}"
+if ! curl -fsSL "$SINGBOX_URL" -o /usr/local/bin/sing-box; then
+    echo -e "${RED}Failed to download sing-box from ${SINGBOX_URL}${NC}"
+    echo -e "${YELLOW}Falling back to source compilation...${NC}"
+
+    # 备用方案：从源码编译
+    cd /tmp
+    rm -rf sing-box-src
+    git clone --depth 1 --branch "v${SINGBOX_VERSION}" https://github.com/SagerNet/sing-box.git sing-box-src
+    cd sing-box-src
+    if ! go build -tags "with_v2ray_api,with_utls" -o sing-box ./cmd/sing-box; then
+        echo -e "${RED}Failed to build sing-box${NC}"
+        cd /tmp && rm -rf sing-box-src
+        exit 1
+    fi
+    mv sing-box /usr/local/bin/
     cd /tmp && rm -rf sing-box-src
-    exit 1
 fi
 
-# 检查编译产物是否存在
-if [ ! -f "sing-box" ]; then
-    echo -e "${RED}sing-box binary not found after build${NC}"
-    cd /tmp && rm -rf sing-box-src
-    exit 1
-fi
-
-# 安装编译好的 sing-box
-mv sing-box /usr/local/bin/
+chmod +x /usr/local/bin/sing-box
 setcap cap_net_bind_service=+ep /usr/local/bin/sing-box
-
-# 清理源码
-cd /tmp
-rm -rf sing-box-src
 
 # 验证安装
 if ! sing-box version > /dev/null 2>&1; then
@@ -144,29 +146,48 @@ echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
 
 cd $INSTALL_DIR
 
-# 克隆或更新代码
+# 下载预编译的 agent
 echo -e "${GREEN}Downloading OTun Node Agent...${NC}"
-if [ -d "repo" ]; then
-    cd repo
-    git fetch origin
-    git reset --hard origin/main
-else
-    git clone https://github.com/antsbtw/sing-box-docker.git repo
-    cd repo
-fi
 
-# 编译 agent
-echo -e "${GREEN}Building agent...${NC}"
-if ! go build -o $INSTALL_DIR/agent ./cmd/agent; then
-    echo -e "${RED}Failed to build agent${NC}"
-    exit 1
+# 确定架构
+case $ARCH in
+    x86_64) AGENT_ARCH="amd64" ;;
+    aarch64) AGENT_ARCH="arm64" ;;
+esac
+
+# 从 GitHub Release 下载预编译的 agent
+AGENT_URL="https://github.com/antsbtw/sing-box-docker/releases/download/latest/agent-linux-${AGENT_ARCH}"
+
+echo -e "${YELLOW}Downloading agent for ${AGENT_ARCH}...${NC}"
+if curl -fsSL "$AGENT_URL" -o $INSTALL_DIR/agent; then
+    chmod +x $INSTALL_DIR/agent
+    echo -e "${GREEN}Agent downloaded successfully${NC}"
+else
+    echo -e "${YELLOW}Download failed, falling back to source compilation...${NC}"
+
+    # 备用方案：从源码编译
+    if [ -d "repo" ]; then
+        cd repo
+        git fetch origin
+        git reset --hard origin/main
+    else
+        git clone https://github.com/antsbtw/sing-box-docker.git repo
+        cd repo
+    fi
+
+    echo -e "${GREEN}Building agent from source...${NC}"
+    if ! go build -o $INSTALL_DIR/agent ./cmd/agent; then
+        echo -e "${RED}Failed to build agent${NC}"
+        exit 1
+    fi
+    cd $INSTALL_DIR
 fi
 
 if [ ! -f "$INSTALL_DIR/agent" ]; then
-    echo -e "${RED}Agent binary not found after build${NC}"
+    echo -e "${RED}Agent binary not found${NC}"
     exit 1
 fi
-echo -e "${GREEN}Agent built successfully${NC}"
+echo -e "${GREEN}Agent ready${NC}"
 
 # 创建数据目录
 mkdir -p $INSTALL_DIR/data
