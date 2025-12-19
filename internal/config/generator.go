@@ -35,6 +35,11 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 			continue
 		}
 
+		// 关键修复：无论用户使用哪些协议，都加入统计列表
+		// 这样可以确保 sing-box V2Ray API 统计该用户的所有流量（VLESS + Shadowsocks）
+		// 从而实现跨协议的统一流量限制
+		statsUsers = append(statsUsers, u.UUID)
+
 		for _, proto := range u.Protocols {
 			switch proto {
 			case "vless":
@@ -42,7 +47,6 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 					"uuid": u.UUID,
 					"flow": "xtls-rprx-vision",
 				})
-				statsUsers = append(statsUsers, u.UUID)
 			case "shadowsocks":
 				ssUsers = append(ssUsers, map[string]any{
 					"name":     u.UUID,
