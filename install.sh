@@ -54,6 +54,8 @@ apt-get install -y -qq git curl
 NODE_API_KEY=""
 NODE_ID="node-$(hostname)"
 VLESS_PORT=443
+MANAGEMENT_MODE="local"
+SERVER_IP=""
 
 # 默认值
 API_URL="https://otun-manager.situstechnologies.com"
@@ -64,18 +66,21 @@ while [[ $# -gt 0 ]]; do
         --node-id) NODE_ID="$2"; shift 2 ;;
         --api-url) API_URL="$2"; shift 2 ;;
         --vless-port) VLESS_PORT="$2"; shift 2 ;;
+        --management-mode) MANAGEMENT_MODE="$2"; shift 2 ;;
+        --server-ip) SERVER_IP="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
 if [ -z "$NODE_API_KEY" ]; then
     echo -e "${RED}Error: --api-key is required${NC}"
-    echo "Usage: $0 --api-key <key> [--node-id <id>] [--vless-port <port>]"
+    echo "Usage: $0 --api-key <key> [--node-id <id>] [--vless-port <port>] [--management-mode local|remote|hybrid] [--server-ip <ip>]"
     exit 1
 fi
 
 echo -e "${YELLOW}Node ID: ${NODE_ID}${NC}"
 echo -e "${YELLOW}VLESS Port: ${VLESS_PORT}${NC}"
+echo -e "${YELLOW}Management Mode: ${MANAGEMENT_MODE}${NC}"
 
 # 安装目录
 INSTALL_DIR="/opt/otun-agent"
@@ -215,6 +220,8 @@ Environment="NODE_API_KEY=$NODE_API_KEY"
 Environment="NODE_ID=$NODE_ID"
 Environment="VLESS_PORT=$VLESS_PORT"
 Environment="OTUN_API_URL=$API_URL"
+Environment="MANAGEMENT_MODE=$MANAGEMENT_MODE"
+Environment="SERVER_IP=$SERVER_IP"
 ExecStart=$INSTALL_DIR/agent
 Restart=always
 RestartSec=5
