@@ -27,6 +27,11 @@ type NodeFile struct {
 	APIURL     string    `json:"api_url"`
 	PollURL    string    `json:"poll_url"`
 	EnrolledAt time.Time `json:"enrolled_at"`
+
+	// 隧道凭据的签名公钥（tunnel v1 §3.3）。
+	// 持久化以便重启后不必等下一次 poll 就能验证凭据。
+	TunnelPubkey string `json:"tunnel_pubkey,omitempty"`
+	TunnelKeyID  string `json:"tunnel_key_id,omitempty"`
 }
 
 func nodeFilePath(dataDir string) string {

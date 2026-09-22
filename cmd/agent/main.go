@@ -21,6 +21,7 @@ import (
 	"otun-node-agent/internal/quota"
 	"otun-node-agent/internal/singbox"
 	"otun-node-agent/internal/stats"
+	"otun-node-agent/internal/tunnel"
 )
 
 // Version 由构建时注入：go build -ldflags "-X main.Version=v1.11.0"
@@ -49,6 +50,10 @@ type Agent struct {
 
 	// Token 接入（外连模式）。nil 表示走存量 API-Key 路径。
 	enrollRunner *enroll.Runner
+
+	// 反向隧道（tunnel v1）。App 经它 SSH 到本机。
+	tunnelMgr *tunnel.Manager
+	sshServer *tunnel.Server
 
 	currentVersion string
 	revoked        bool
@@ -802,6 +807,49 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		SingboxRunning: a.manager.IsRunning,
 	}
 
+	// ── 反向隧道（tunnel v1）──────────────────────────────
+	//
+	// 内置 SSH 服务端不监听任何网络端口（S-1）：它只从隧道 WS 收连接，
+	// 所以不会扩大这台机器的攻击面。
+	var setupTunnel func(nodeID, nodeSecret string) error
+	setupTunnel = func(nodeID, nodeSecret string) error {
+		srv, err := tunnel.NewServer(nodeID, nodeSecret, tunnel.NewCredVerifier())
+		if err != nil {
+			return err
+		}
+		// 凭据有效期以**后端时间**判定，不信本机时钟（契约 §3.2 第 4 条）
+		srv.ServerTime = time.Now
+
+		a.sshServer = srv
+		a.tunnelMgr = tunnel.NewManager(nodeID, nodeSecret, srv, 3)
+		executor.EnableTunnel(a.tunnelMgr)
+		return nil
+	}
+
+	applyTunnelKey := func(pubkeyB64, keyID string) {
+		if a.sshServer == nil {
+			return
+		}
+		pub, err := tunnel.ParsePubkey(pubkeyB64)
+		if err != nil {
+			log.Printf("[tunnel] 后端公钥无法解析：%v", err)
+			return
+		}
+		a.sshServer.SetTunnelKey(pub, keyID)
+		log.Printf("[tunnel] 已更新隧道签名公钥 (kid=%s)", keyID)
+	}
+
+	// 已接入的节点：先用 node.json 里缓存的公钥建起来，
+	// 不必等第一次 poll —— 否则刚重启就开终端会被拒。
+	if existing != nil {
+		if err := setupTunnel(existing.NodeID, existing.NodeSecret); err != nil {
+			log.Printf("[tunnel] 初始化失败：%v", err)
+		} else if existing.TunnelPubkey != "" {
+			applyTunnelKey(existing.TunnelPubkey, existing.TunnelKeyID)
+		}
+	}
+	runner.OnTunnelKey = applyTunnelKey
+
 	if err := runner.Prepare(ctx); err != nil {
 		// 注册终态（token 已废、版本过低）：不能让进程继续以普通 local 模式
 		// 活着 —— systemctl status 会显示 active，看着正常实则没接入。
@@ -813,6 +861,17 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		return err
 	}
 	a.enrollRunner = runner
+
+	// 首次注册：此时才有 node_id / node_secret，补建隧道
+	if a.sshServer == nil {
+		if nf, err := enroll.LoadNodeFile(dataDir); err == nil && nf != nil {
+			if err := setupTunnel(nf.NodeID, nf.NodeSecret); err != nil {
+				log.Printf("[tunnel] 初始化失败：%v", err)
+			} else if nf.TunnelPubkey != "" {
+				applyTunnelKey(nf.TunnelPubkey, nf.TunnelKeyID)
+			}
+		}
+	}
 
 	go func() {
 		err := runner.Run(ctx)
@@ -830,7 +889,10 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 			//
 			// 先清用户再停服务：不清的话机器重启后 agent 会以普通 local 模式
 			// 把老用户全部重新拉起，一个已删除的节点继续给人当出口。
-			log.Println("[enroll] 收到解绑指令，清除本地用户并停止 sing-box")
+			log.Println("[enroll] 收到解绑指令，关闭隧道、清除本地用户并停止 sing-box")
+			if a.tunnelMgr != nil {
+				a.tunnelMgr.CloseAll()
+			}
 			if a.localStore != nil {
 				if err := a.localStore.Clear(); err != nil {
 					log.Printf("[enroll] 清除本地用户失败：%v", err)

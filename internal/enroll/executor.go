@@ -6,6 +6,7 @@ package enroll
 // 不新造一套用户管理逻辑。Token 模式与存量 API-Key 模式共用同一份状态。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -14,6 +15,14 @@ import (
 
 	"otun-node-agent/internal/local"
 )
+
+// TunnelOpener 建立一条隧道。由 tunnel.Manager 实现。
+//
+// 用接口而非直接依赖 tunnel 包：executor 不需要知道隧道是怎么连的，
+// 也便于测试注入。
+type TunnelOpener interface {
+	Open(ctx context.Context, sessionID, tunnelURL string) error
+}
 
 // NodeInfoProvider 提供 get_config 要回报的节点参数。
 type NodeInfoProvider interface {
@@ -35,6 +44,10 @@ type Executor struct {
 	// pendingExit 由 upgrade_agent 置位：新二进制已就位，
 	// 但必须等回执送达后才能退出（契约 §7.4）。
 	pendingExit bool
+
+	// tunnel 为 nil 时 open_tunnel 回 unsupported_type，
+	// 后端据此让 App 提示"请升级节点 agent"（tunnel v1 §2.1-3）。
+	tunnel TunnelOpener
 
 	// 已完成指令的回执缓存。契约 §6.4：后端可能因回执丢失而重投，
 	// 重复收到时直接重放原回执，不要重新执行。
@@ -93,6 +106,8 @@ func (e *Executor) execute(cmd Command, serverTime time.Time) CommandAck {
 		return done(nil)
 	case CmdUpgradeAgent:
 		return e.upgradeAgent(cmd)
+	case CmdOpenTunnel:
+		return e.openTunnel(cmd)
 	default:
 		// 未知类型回 unsupported_type，后端据此降级（契约 §11）
 		return failed(ErrUnsupportedType, "不支持的指令类型: "+cmd.Type)
@@ -237,6 +252,43 @@ func (e *Executor) doReload() CommandAck {
 		return failed(ErrSingboxApplyFailed, err.Error())
 	}
 	return done(nil)
+}
+
+// EnableTunnel 开启 open_tunnel 支持。
+func (e *Executor) EnableTunnel(t TunnelOpener) { e.tunnel = t }
+
+type openTunnelPayload struct {
+	SessionID string    `json:"session_id"`
+	TunnelURL string    `json:"tunnel_url"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// openTunnel 处理 open_tunnel 指令（tunnel v1 §2.1）。
+//
+// 必须**立即**连接并据实回执：连上回 done，失败回 failed，
+// 后端据此决定是否关会话 —— App 正在等着这个结果，
+// 拖延或谎报都会让用户对着转圈的界面等到超时。
+func (e *Executor) openTunnel(cmd Command) CommandAck {
+	if e.tunnel == nil {
+		return failed(ErrUnsupportedType, "本版本不支持隧道")
+	}
+
+	var p openTunnelPayload
+	if err := decodePayload(cmd.Payload, &p); err != nil {
+		return failed(ErrInvalidPayload, err.Error())
+	}
+	if p.SessionID == "" || p.TunnelURL == "" {
+		return failed(ErrInvalidPayload, "session_id 与 tunnel_url 必填")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := e.tunnel.Open(ctx, p.SessionID, p.TunnelURL); err != nil {
+		log.Printf("[tunnel] 建立会话 %s 失败：%v", p.SessionID, err)
+		return failed(ErrTunnelConnectFailed, err.Error())
+	}
+	return done(map[string]any{"session_id": p.SessionID})
 }
 
 // UpgradeConfig 自升级所需的本机信息。

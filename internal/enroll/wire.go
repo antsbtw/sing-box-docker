@@ -40,6 +40,11 @@ type RegisterResponse struct {
 	PollMaxWaitS       int       `json:"poll_max_wait_s"`
 	ServerTime         time.Time `json:"server_time"`
 	Reenrolled         bool      `json:"reenrolled"`
+
+	// 隧道凭据的签名公钥（tunnel v1 §3.3）。注册与轮询响应都会下发，
+	// 已接入的旧 agent 从下一次 poll 即可拿到，无需重注册。
+	TunnelPubkey string `json:"tunnel_pubkey,omitempty"`
+	TunnelKeyID  string `json:"tunnel_key_id,omitempty"`
 }
 
 // ── 长轮询 §5 ──────────────────────────────────────────────
@@ -77,6 +82,10 @@ type PollResponse struct {
 	Commands   []Command `json:"commands"`
 	Acked      []string  `json:"acked"`
 	NextWaitS  int       `json:"next_wait_s"`
+
+	// 隧道签名公钥。key_id 变化时 agent 应覆盖本地缓存（tunnel v1 §3.3）。
+	TunnelPubkey string `json:"tunnel_pubkey,omitempty"`
+	TunnelKeyID  string `json:"tunnel_key_id,omitempty"`
 }
 
 // ── 指令 §6 ────────────────────────────────────────────────
@@ -107,6 +116,8 @@ const (
 	CmdReload           = "reload"
 	CmdPing             = "ping"
 	CmdUpgradeAgent     = "upgrade_agent"
+	// tunnel v1 §2.1：后端要求 agent 开一条隧道
+	CmdOpenTunnel = "open_tunnel"
 )
 
 // 回执结果与错误码（契约 §6.3）
@@ -120,7 +131,9 @@ const (
 	ErrInvalidPayload     = "invalid_payload"
 	ErrSingboxApplyFailed = "singbox_apply_failed"
 	ErrUnsupportedType    = "unsupported_type"
-	ErrInternal           = "internal"
+	// tunnel v1 §2.1：隧道 WS 连接失败，后端据此关会话让 App 立刻知道
+	ErrTunnelConnectFailed = "tunnel_connect_failed"
+	ErrInternal            = "internal"
 )
 
 // ── 错误响应 §10 ───────────────────────────────────────────

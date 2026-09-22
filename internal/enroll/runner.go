@@ -54,6 +54,10 @@ type Runner struct {
 	// 可注入主要是为了让测试不依赖外网。
 	DetectIP func(context.Context) string
 
+	// OnTunnelKey 在注册与每次轮询后回调，交付后端的隧道签名公钥
+	// （tunnel v1 §3.3）。key_id 变化即表示后端换钥，需覆盖本地缓存。
+	OnTunnelKey func(pubkeyB64, keyID string)
+
 	// ExePath 当前可执行文件路径，用于升级后的回滚判定。为空则不回滚。
 	ExePath string
 
@@ -171,13 +175,16 @@ func (r *Runner) register(ctx context.Context) error {
 	}
 
 	nf := &NodeFile{
-		NodeID:     resp.NodeID,
-		NodeSecret: resp.NodeSecret,
-		MachineID:  mid,
-		APIURL:     r.APIURL,
-		PollURL:    resp.PollURL,
-		EnrolledAt: time.Now().UTC(),
+		NodeID:       resp.NodeID,
+		NodeSecret:   resp.NodeSecret,
+		MachineID:    mid,
+		APIURL:       r.APIURL,
+		PollURL:      resp.PollURL,
+		EnrolledAt:   time.Now().UTC(),
+		TunnelPubkey: resp.TunnelPubkey,
+		TunnelKeyID:  resp.TunnelKeyID,
 	}
+	r.deliverTunnelKey(resp.TunnelPubkey, resp.TunnelKeyID)
 	// ⚠️ 必须先写盘再开始轮询：install.sh 正在轮询这个文件，
 	// 看到它才会删掉 systemd 里的一次性 token（契约 §2.4 第 2 步）。
 	if err := SaveNodeFile(r.DataDir, nf); err != nil {
@@ -257,6 +264,9 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		attempt = 0
+		// 后端可能换钥；key_id 变化时覆盖本地缓存（tunnel v1 §3.3）
+		r.deliverTunnelKey(resp.TunnelPubkey, resp.TunnelKeyID)
+
 		// 能连上后端就说明当前版本是好的：清掉备份，避免日后误回滚
 		if r.consecutiveFailures > 0 || r.ExePath != "" {
 			r.consecutiveFailures = 0
@@ -314,6 +324,31 @@ func (r *Runner) Run(ctx context.Context) error {
 // minPollGap 是两次轮询之间的最小间隔，防止服务端提前返回时空转。
 // 取 1 秒：远小于正常的 25 秒挂起，不影响指令延迟。
 const minPollGap = time.Second
+
+// deliverTunnelKey 把后端下发的隧道公钥交给上层，并持久化到 node.json。
+//
+// 持久化的意义：重启后不必等下一次 poll 就能验证凭据 ——
+// 否则用户刚重启完就开终端会被拒。
+func (r *Runner) deliverTunnelKey(pubkeyB64, keyID string) {
+	if pubkeyB64 == "" || keyID == "" {
+		return
+	}
+	if r.node != nil && r.node.TunnelKeyID == keyID {
+		return // 未变化
+	}
+
+	if r.OnTunnelKey != nil {
+		r.OnTunnelKey(pubkeyB64, keyID)
+	}
+
+	if r.node != nil {
+		r.node.TunnelPubkey = pubkeyB64
+		r.node.TunnelKeyID = keyID
+		if err := SaveNodeFile(r.DataDir, r.node); err != nil {
+			log.Printf("[tunnel] 持久化隧道公钥失败：%v", err)
+		}
+	}
+}
 
 // shouldRollback 判断是否该回滚：存在备份且新版本连续多次连不上。
 //
