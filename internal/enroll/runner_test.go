@@ -39,6 +39,8 @@ func newRunner(t *testing.T, srv *httptest.Server) *Runner {
 		Stats:          fakeStats{m: map[string]UserStat{}},
 		Store:          fakeStore{},
 		SingboxRunning: func() bool { return true },
+		// 不依赖外网：契约允许 reported_ip 留空
+		DetectIP: func(context.Context) string { return "" },
 	}
 }
 

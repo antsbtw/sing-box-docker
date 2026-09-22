@@ -50,6 +50,10 @@ type Runner struct {
 	// SingboxRunning 报告数据面是否正常（/health 的同一判据）
 	SingboxRunning func() bool
 
+	// DetectIP 自测公网 IP，为空则用默认实现。
+	// 可注入主要是为了让测试不依赖外网。
+	DetectIP func(context.Context) string
+
 	// ExePath 当前可执行文件路径，用于升级后的回滚判定。为空则不回滚。
 	ExePath string
 
@@ -114,6 +118,14 @@ func (r *Runner) register(ctx context.Context) error {
 		return fmt.Errorf("compute machine_id: %w", err)
 	}
 	req.MachineID = mid
+
+	// 可选字段：拿不到就留空（契约 §4.1）。后端以请求来源 IP 为准，
+	// 这个值只用来对照、标记 nat_suspected，不能因它失败而阻塞注册。
+	detect := r.DetectIP
+	if detect == nil {
+		detect = DetectPublicIP
+	}
+	req.ReportedIP = detect(ctx)
 
 	log.Printf("[enroll] 开始注册，machine_id=%s…", mid[:12])
 
