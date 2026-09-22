@@ -16,6 +16,8 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -140,18 +142,26 @@ func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 	defer ch.Close()
 
 	var (
+		mu      sync.Mutex // 保护 ptyFile / cmd：请求循环与 pipe 协程并发访问
 		ptyReq  *ptyRequest
 		ptyFile *os.File
 		cmd     *exec.Cmd
 		started bool
 	)
 
+	// pipe 在独立协程里跑，请求循环必须保持可用，
+	// 否则 shell 启动后的 window-change（旋屏、键盘弹出）永远排不到处理（A-6）。
+	piped := make(chan struct{})
+
 	defer func() {
-		if ptyFile != nil {
-			_ = ptyFile.Close()
+		mu.Lock()
+		f, c := ptyFile, cmd
+		mu.Unlock()
+		if f != nil {
+			_ = f.Close()
 		}
-		if cmd != nil && cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		if c != nil && c.Process != nil {
+			_ = c.Process.Kill()
 		}
 	}()
 
@@ -168,8 +178,15 @@ func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 
 		case "window-change":
 			// A-6：手机键盘弹出、旋屏时同步窗口尺寸
-			if p, err := parseWindowChange(req.Payload); err == nil && ptyFile != nil {
-				setWinsize(ptyFile, p.cols, p.rows)
+			if p, err := parseWindowChange(req.Payload); err == nil {
+				mu.Lock()
+				if ptyFile != nil {
+					setWinsize(ptyFile, p.cols, p.rows)
+				} else if ptyReq != nil {
+					// shell 尚未启动，记下尺寸，startShell 时一并生效
+					ptyReq.cols, ptyReq.rows = p.cols, p.rows
+				}
+				mu.Unlock()
 			}
 
 		case "shell":
@@ -184,10 +201,19 @@ func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				_ = req.Reply(false, nil)
 				return
 			}
+			mu.Lock()
 			cmd, ptyFile = c, f
+			mu.Unlock()
 			_ = req.Reply(true, nil)
-			s.pipe(ch, ptyFile, cmd)
-			return
+			go func() {
+				defer close(piped)
+				s.pipe(ch, f, c)
+				// ptyFile 的所有权收回锁内：置空后 window-change 不会再 ioctl 已关闭的 fd
+				mu.Lock()
+				ptyFile = nil
+				mu.Unlock()
+				_ = f.Close()
+			}()
 
 		case "exec":
 			if started {
@@ -211,20 +237,24 @@ func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			_ = req.Reply(false, nil)
 		}
 	}
+
+	// reqs 关闭（客户端收起 channel）后，若 shell 仍在跑，等 pipe 收尾，
+	// 避免 defer 抢在 pipe 之前关掉 ptyFile。
+	mu.Lock()
+	running := ptyFile != nil
+	mu.Unlock()
+	if running {
+		<-piped
+	}
 }
 
 // startShell 启动带 PTY 的交互式 shell（A-4、A-7）。
 func (s *Server) startShell(p *ptyRequest) (*exec.Cmd, *os.File, error) {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
-		if _, err := os.Stat(shell); err != nil {
-			shell = "/bin/sh"
-		}
-	}
+	shell := loginShell()
 
 	cmd := exec.Command(shell, "-l")
-	cmd.Env = append(os.Environ(), "TERM="+termOrDefault(p))
+	cmd.Env = shellEnv(termOrDefault(p))
+	cmd.Dir = homeDir()
 
 	f, err := pty.Start(cmd)
 	if err != nil {
@@ -234,6 +264,95 @@ func (s *Server) startShell(p *ptyRequest) (*exec.Cmd, *os.File, error) {
 		setWinsize(f, p.cols, p.rows)
 	}
 	return cmd, f, nil
+}
+
+// loginShell 选一个可用的交互 shell。
+// systemd 服务环境不带 SHELL，所以不能只靠环境变量。
+func loginShell() string {
+	if sh := os.Getenv("SHELL"); sh != "" {
+		if _, err := os.Stat(sh); err == nil {
+			return sh
+		}
+	}
+	for _, sh := range []string{"/bin/bash", "/bin/sh"} {
+		if _, err := os.Stat(sh); err == nil {
+			return sh
+		}
+	}
+	return "/bin/sh"
+}
+
+// homeDir 返回当前用户的 HOME。
+// systemd 不传 HOME，缺了它 vi/top 等程序无处写配置（A-4）。
+func homeDir() string {
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return u.HomeDir
+	}
+	return "/root"
+}
+
+// shellEnv 组装交互 shell 的环境。
+//
+// agent 由 systemd 拉起，拿到的是被裁剪过的环境：没有 HOME/USER/LOGNAME，
+// PATH 也可能只有 /usr/bin:/bin。直接 append 到 os.Environ() 上，
+// 登录脚本会因为认不出终端而把 TERM 清空，vi、top 跟着一起坏（A-4、A-6）。
+// 这里补齐登录 shell 该有的那几个变量，并剔除 agent 自己的密钥类变量 ——
+// 终端是给用户用的，没必要把 node secret 摆在 env 里。
+func shellEnv(term string) []string {
+	home := homeDir()
+	uname := os.Getenv("USER")
+	if uname == "" {
+		if u, err := user.Current(); err == nil {
+			uname = u.Username
+		} else {
+			uname = "root"
+		}
+	}
+
+	path := os.Getenv("PATH")
+	if path == "" {
+		path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+
+	env := make([]string, 0, len(os.Environ())+6)
+	for _, kv := range os.Environ() {
+		if isSensitiveEnv(kv) {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(kv, "TERM="),
+			strings.HasPrefix(kv, "HOME="),
+			strings.HasPrefix(kv, "USER="),
+			strings.HasPrefix(kv, "LOGNAME="),
+			strings.HasPrefix(kv, "SHELL="),
+			strings.HasPrefix(kv, "PATH="):
+			continue // 由下面统一补齐
+		}
+		env = append(env, kv)
+	}
+	return append(env,
+		"TERM="+term,
+		"HOME="+home,
+		"USER="+uname,
+		"LOGNAME="+uname,
+		"SHELL="+loginShell(),
+		"PATH="+path,
+	)
+}
+
+// isSensitiveEnv 过滤掉 agent 自身的凭据，避免出现在用户终端的 env 里。
+func isSensitiveEnv(kv string) bool {
+	for _, k := range []string{
+		"NODE_API_KEY=", "OTUN_ENROLL_TOKEN=", "NODE_SECRET=",
+	} {
+		if strings.HasPrefix(kv, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // runExec 执行一条非交互命令（A-5，安装脚本用）。
@@ -272,7 +391,6 @@ func (s *Server) pipe(ch ssh.Channel, ptyFile *os.File, cmd *exec.Cmd) {
 	}()
 
 	<-done
-	_ = ptyFile.Close()
 
 	code := 0
 	if err := cmd.Wait(); err != nil {

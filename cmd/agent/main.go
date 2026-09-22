@@ -57,7 +57,17 @@ type Agent struct {
 
 	currentVersion string
 	revoked        bool
-	mu             sync.RWMutex
+	// shutdown 收束 Run 的根 context：解绑是终态，必须立刻退出，
+	// 不能等到收到信号才被发现（接线契约 §5.3）。
+	shutdown context.CancelFunc
+	mu       sync.RWMutex
+}
+
+// Revoked 报告节点是否已被后端解绑。
+func (a *Agent) Revoked() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.revoked
 }
 
 func main() {
@@ -98,13 +108,18 @@ func main() {
 		cancel()
 	}()
 
+	// 登记收束句柄：解绑时由 enroll 回调触发，Run 随即返回。
+	agent.mu.Lock()
+	agent.shutdown = cancel
+	agent.mu.Unlock()
+
 	// 启动 Agent
 	agent.Run(ctx)
 
 	// 节点被后端解绑：停服、清凭据，并以约定退出码结束。
 	// systemd 单元配了 RestartPreventExitStatus=3，据此不再拉起 ——
 	// 否则会每 5 秒去打一个已吊销的节点（接线契约 §5.3）。
-	if agent.revoked {
+	if agent.Revoked() {
 		log.Println("节点已解绑，agent 退出且不再重启")
 		os.Exit(enroll.ExitRevoked)
 	}
@@ -885,27 +900,44 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		}
 
 		if errors.Is(err, enroll.ErrRevoked) {
-			// 终态：清用户 → 停数据面 → 清凭据（契约 §5.3）
-			//
-			// 先清用户再停服务：不清的话机器重启后 agent 会以普通 local 模式
-			// 把老用户全部重新拉起，一个已删除的节点继续给人当出口。
-			log.Println("[enroll] 收到解绑指令，关闭隧道、清除本地用户并停止 sing-box")
-			if a.tunnelMgr != nil {
-				a.tunnelMgr.CloseAll()
-			}
-			if a.localStore != nil {
-				if err := a.localStore.Clear(); err != nil {
-					log.Printf("[enroll] 清除本地用户失败：%v", err)
-				}
-			}
-			_ = a.manager.Stop()
-			runner.Cleanup()
-			a.mu.Lock()
-			a.revoked = true
-			a.mu.Unlock()
+			a.handleRevoked(runner.Cleanup)
 		}
 	}()
 	return nil
+}
+
+// handleRevoked 执行解绑终态：清用户 → 停数据面 → 清凭据 → 收束主循环（契约 §5.3）。
+//
+// 先清用户再停服务：不清的话机器重启后 agent 会以普通 local 模式
+// 把老用户全部重新拉起，一个已删除的节点继续给人当出口。
+//
+// 最后必须收束主循环 —— 只置 revoked 标志是不够的：Run 仅在收到信号时返回，
+// main 里的退出码 3 检查永远执行不到，进程会一直挂着（后端联调实测）。
+func (a *Agent) handleRevoked(cleanup func()) {
+	log.Println("[enroll] 收到解绑指令，关闭隧道、清除本地用户并停止 sing-box")
+	if a.tunnelMgr != nil {
+		a.tunnelMgr.CloseAll()
+	}
+	if a.localStore != nil {
+		if err := a.localStore.Clear(); err != nil {
+			log.Printf("[enroll] 清除本地用户失败：%v", err)
+		}
+	}
+	if a.manager != nil {
+		_ = a.manager.Stop()
+	}
+	if cleanup != nil {
+		cleanup()
+	}
+
+	a.mu.Lock()
+	a.revoked = true
+	stop := a.shutdown
+	a.mu.Unlock()
+
+	if stop != nil {
+		stop()
+	}
 }
 
 // reloadForCommand 供 reload 指令调用：重新生成配置并应用。
