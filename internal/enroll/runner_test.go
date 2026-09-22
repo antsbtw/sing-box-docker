@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -280,5 +282,118 @@ func TestNoHotLoopWhenAcksNeverAcknowledged(t *testing.T) {
 	}
 	if len(r.pendingAcks) == 0 {
 		t.Error("未被确认的回执应继续保留在队列中")
+	}
+}
+
+// 契约 §7.4-1 的核心顺序：升级回执必须先被后端确认，才能退出。
+// 先退出则回执丢失，后端重投 upgrade_agent，而新版本已经在跑了。
+func TestUpgradeExitsOnlyAfterAckConfirmed(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "agent")
+	if err := os.WriteFile(exe, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var polls int32
+	var ackedRound int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&polls, 1)
+		var req PollRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+
+		resp := PollResponse{ServerTime: time.Now(), NextWaitS: 25}
+		switch {
+		case n == 1:
+			resp.Commands = []Command{{
+				CommandID: "up-1", Type: CmdUpgradeAgent,
+				ExpiresAt: time.Now().Add(time.Minute),
+				// 故意给一个不可达的 release：升级会失败，
+				// 但我们验的是"未确认前不退出"这一顺序
+				Payload: map[string]any{"release_tag": "v9.9.9"},
+			}}
+		case len(req.Acks) > 0 && atomic.LoadInt32(&ackedRound) == 0:
+			// 第一次收到回执时**不确认**，agent 必须继续轮询
+			atomic.StoreInt32(&ackedRound, n)
+		case len(req.Acks) > 0:
+			resp.Acked = []string{"up-1"}
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	r := newRunner(t, srv)
+	r.ExePath = exe
+	r.node = &NodeFile{NodeID: "n", NodeSecret: "s", PollURL: srv.URL + "/poll"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	// 至少要有：领指令(1) + 送回执未确认(2) + 再送并确认(3)
+	if n := atomic.LoadInt32(&polls); n < 3 {
+		t.Errorf("回执未确认前不应退出，只轮询了 %d 次", n)
+	}
+}
+
+// 新版本连不上后端时回滚 —— 否则一个坏版本让全部节点失联且无人能远程修。
+func TestRollbackAfterConsecutiveFailures(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "agent")
+	if err := os.WriteFile(exe, []byte("BROKEN-NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(exe+prevSuffix, []byte("GOOD-OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 服务端一直 5xx，模拟新版本连不上
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+		_ = json.NewEncoder(w).Encode(APIError{Code: ErrServerInternal})
+	}))
+	defer srv.Close()
+
+	r := newRunner(t, srv)
+	r.ExePath = exe
+	r.node = &NodeFile{NodeID: "n", NodeSecret: "s", PollURL: srv.URL + "/poll"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	err := r.Run(ctx)
+
+	if !errors.Is(err, ErrUpgraded) {
+		t.Fatalf("连续失败应触发回滚并返回 ErrUpgraded，得到 %v", err)
+	}
+	got, _ := os.ReadFile(exe)
+	if string(got) != "GOOD-OLD" {
+		t.Errorf("应已回滚到旧版本，当前内容 %q", got)
+	}
+}
+
+// 没有备份时不该误触发回滚（正常运行期间的网络抖动）。
+func TestNoRollbackWithoutBackup(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "agent")
+	if err := os.WriteFile(exe, []byte("CURRENT"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(503)
+	}))
+	defer srv.Close()
+
+	r := newRunner(t, srv)
+	r.ExePath = exe
+	r.node = &NodeFile{NodeID: "n", NodeSecret: "s", PollURL: srv.URL + "/poll"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	if err := r.Run(ctx); errors.Is(err, ErrUpgraded) {
+		t.Error("无备份时不应触发回滚")
+	}
+	got, _ := os.ReadFile(exe)
+	if string(got) != "CURRENT" {
+		t.Errorf("二进制不应被改动，得到 %q", got)
 	}
 }

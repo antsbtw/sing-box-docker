@@ -29,6 +29,13 @@ type Executor struct {
 	agentVersion string
 	reload       func() error
 
+	// 自升级。为空则 upgrade_agent 回 unsupported_type，后端按契约 §11 降级。
+	upgrade *UpgradeConfig
+
+	// pendingExit 由 upgrade_agent 置位：新二进制已就位，
+	// 但必须等回执送达后才能退出（契约 §7.4）。
+	pendingExit bool
+
 	// 已完成指令的回执缓存。契约 §6.4：后端可能因回执丢失而重投，
 	// 重复收到时直接重放原回执，不要重新执行。
 	mu     sync.Mutex
@@ -84,6 +91,8 @@ func (e *Executor) execute(cmd Command, serverTime time.Time) CommandAck {
 		return e.doReload()
 	case CmdPing:
 		return done(nil)
+	case CmdUpgradeAgent:
+		return e.upgradeAgent(cmd)
 	default:
 		// 未知类型回 unsupported_type，后端据此降级（契约 §11）
 		return failed(ErrUnsupportedType, "不支持的指令类型: "+cmd.Type)
@@ -228,6 +237,54 @@ func (e *Executor) doReload() CommandAck {
 		return failed(ErrSingboxApplyFailed, err.Error())
 	}
 	return done(nil)
+}
+
+// UpgradeConfig 自升级所需的本机信息。
+type UpgradeConfig struct {
+	Repo    string // 形如 antsbtw/sing-box-docker
+	ExePath string // 当前可执行文件路径
+}
+
+// EnableUpgrade 开启 upgrade_agent 支持。
+func (e *Executor) EnableUpgrade(cfg *UpgradeConfig) { e.upgrade = cfg }
+
+// PendingExit 报告是否有已就位、等待回执送达后重启的升级。
+func (e *Executor) PendingExit() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.pendingExit
+}
+
+// upgradeAgent 下载并就位新版本，但**不在这里退出** ——
+// 回执必须先送达后端。退出由 Runner 在确认 acked 之后执行（契约 §7.4）。
+func (e *Executor) upgradeAgent(cmd Command) CommandAck {
+	if e.upgrade == nil {
+		return failed(ErrUnsupportedType, "本版本不支持自升级")
+	}
+
+	var plan UpgradePlan
+	if err := decodePayload(cmd.Payload, &plan); err != nil {
+		return failed(ErrInvalidPayload, err.Error())
+	}
+
+	// 已是目标版本：幂等，不重复下载（契约 §6.4）
+	if plan.ReleaseTag == e.agentVersion {
+		return done(map[string]any{"from": e.agentVersion, "to": plan.ReleaseTag})
+	}
+
+	if err := PrepareUpgrade(plan, e.upgrade.Repo, e.upgrade.ExePath); err != nil {
+		// 升级失败不影响当前版本继续服务 —— 旧二进制没被动过
+		log.Printf("[upgrade] 失败：%v", err)
+		return failed(ErrInternal, err.Error())
+	}
+
+	e.mu.Lock()
+	e.pendingExit = true
+	e.mu.Unlock()
+
+	log.Printf("[upgrade] %s → %s 已就位，等待回执送达后重启",
+		e.agentVersion, plan.ReleaseTag)
+	return done(map[string]any{"from": e.agentVersion, "to": plan.ReleaseTag})
 }
 
 // ── 幂等缓存 ──────────────────────────────────────────────

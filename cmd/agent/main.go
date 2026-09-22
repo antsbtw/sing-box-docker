@@ -771,13 +771,31 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 	}
 
 	info := nodeInfo{a: a}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		// 拿不到路径就不开自升级，其余功能照常 —— 宁可不能远程升级，
+		// 也不要在错误的路径上覆盖文件
+		log.Printf("[upgrade] 无法确定可执行文件路径，自升级已禁用：%v", err)
+		exePath = ""
+	}
+
+	executor := enroll.NewExecutor(a.localStore, info, Version, a.reloadForCommand)
+	if exePath != "" {
+		executor.EnableUpgrade(&enroll.UpgradeConfig{
+			Repo:    "antsbtw/sing-box-docker",
+			ExePath: exePath,
+		})
+	}
+
 	runner := &enroll.Runner{
 		DataDir:        dataDir,
+		ExePath:        exePath,
 		APIURL:         a.cfg.APIURL,
 		AgentVersion:   Version,
 		Token:          token,
 		Client:         enroll.NewClient(a.cfg.APIURL, Version),
-		Executor:       enroll.NewExecutor(a.localStore, info, Version, a.reloadForCommand),
+		Executor:       executor,
 		Info:           info,
 		Stats:          statsAdapter{c: a.collector},
 		Store:          storeAdapter{s: a.localStore},
@@ -798,6 +816,15 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 
 	go func() {
 		err := runner.Run(ctx)
+
+		// 新版本已就位且回执已确认：以 0 退出，systemd 拉起新二进制。
+		// 用 0 而非 3 —— 3 会触发 RestartPreventExitStatus 不再重启（§7.4-1）。
+		if errors.Is(err, enroll.ErrUpgraded) {
+			log.Println("[upgrade] 退出以启用新版本")
+			_ = a.manager.Stop()
+			os.Exit(0)
+		}
+
 		if errors.Is(err, enroll.ErrRevoked) {
 			// 终态：清用户 → 停数据面 → 清凭据（契约 §5.3）
 			//

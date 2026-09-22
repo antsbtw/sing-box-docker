@@ -50,9 +50,15 @@ type Runner struct {
 	// SingboxRunning 报告数据面是否正常（/health 的同一判据）
 	SingboxRunning func() bool
 
+	// ExePath 当前可执行文件路径，用于升级后的回滚判定。为空则不回滚。
+	ExePath string
+
 	node      *NodeFile
 	bootID    string
 	startedAt time.Time
+
+	// 连续轮询失败次数，用于判断刚升级的新版本是不是坏的
+	consecutiveFailures int
 
 	// 待回执队列：后端未确认的回执下次继续带（契约 §5.1）
 	pendingAcks []CommandAck
@@ -215,6 +221,21 @@ func (r *Runner) Run(ctx context.Context) error {
 			}
 
 			attempt++
+			r.consecutiveFailures++
+
+			// 刚升级过且新版本连不上后端：换回旧版本再退出。
+			// 没有这条路径，一个坏版本会让全部节点失联且无人能远程修
+			// （复核 §7.4-2）。
+			if r.shouldRollback() {
+				log.Printf("[upgrade] 新版本连续 %d 次轮询失败，回滚到上一版本",
+					r.consecutiveFailures)
+				if err := Rollback(r.ExePath); err != nil {
+					log.Printf("[upgrade] 回滚失败：%v", err)
+				} else {
+					return ErrUpgraded // 以 0 退出，systemd 拉起旧版本
+				}
+			}
+
 			d := Backoff(attempt)
 			log.Printf("[enroll] 轮询失败（%v），%v 后重试", err, d.Truncate(time.Millisecond))
 			if !sleepCtx(ctx, d) {
@@ -224,7 +245,24 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 
 		attempt = 0
+		// 能连上后端就说明当前版本是好的：清掉备份，避免日后误回滚
+		if r.consecutiveFailures > 0 || r.ExePath != "" {
+			r.consecutiveFailures = 0
+			if r.ExePath != "" && HasPrevVersion(r.ExePath) {
+				ClearPrevVersion(r.ExePath)
+				log.Println("[upgrade] 新版本已确认可用，清除回滚备份")
+			}
+		}
+
 		r.dropAcked(resp.Acked)
+
+		// 升级回执已被后端确认 → 现在才能退出重启。
+		// 顺序不能反：先退出的话回执丢失，后端会重投 upgrade_agent，
+		// 而新版本已经在跑了（契约 §7.4-1）。
+		if r.Executor.PendingExit() && r.allAcksConfirmed() {
+			log.Println("[upgrade] 回执已确认，退出以启用新版本")
+			return ErrUpgraded
+		}
 
 		newAcks := 0
 		for _, cmd := range resp.Commands {
@@ -265,8 +303,33 @@ func (r *Runner) Run(ctx context.Context) error {
 // 取 1 秒：远小于正常的 25 秒挂起，不影响指令延迟。
 const minPollGap = time.Second
 
+// shouldRollback 判断是否该回滚：存在备份且新版本连续多次连不上。
+//
+// 阈值 3 次：偶发网络抖动不该触发回滚，而真正的坏版本会持续失败。
+func (r *Runner) shouldRollback() bool {
+	const threshold = 3
+	return r.ExePath != "" &&
+		r.consecutiveFailures >= threshold &&
+		HasPrevVersion(r.ExePath)
+}
+
+// allAcksConfirmed 报告是否所有回执都已被后端确认。
+//
+// 在 dropAcked 之后调用：队列为空即包括升级回执在内全部确认。
+// 升级必须等到这一刻才能退出 —— 先退出则回执丢失，后端重投
+// upgrade_agent，而新版本已经在跑了（契约 §7.4-1）。
+func (r *Runner) allAcksConfirmed() bool {
+	return len(r.pendingAcks) == 0
+}
+
 // ErrRevoked 表示后端已吊销本节点。
 var ErrRevoked = errors.New("node revoked")
+
+// ErrUpgraded 表示新版本已就位且回执已被后端确认，可以退出重启了。
+//
+// 调用方应以退出码 0 结束：unit 的 Restart=always 会拉起新二进制，
+// 而 0 不触发 RestartPreventExitStatus=3（复核 §7.4-1）。
+var ErrUpgraded = errors.New("agent upgraded, restart required")
 
 // ErrEnrollFatal 表示注册遇到终态错误（token 已废、版本过低等）。
 //
