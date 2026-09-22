@@ -28,6 +28,9 @@ type NodeConfig struct {
 	VLESSPort int    `json:"vless_port"`
 	SSPort    int    `json:"ss_port"`
 	SSMethod  string `json:"ss_method"`
+	// Reality SNI。与生成器用的是同一个值（来自 REALITY_SNI 配置），
+	// 不能各写死一份 —— 两边不一致客户端就连不上（接线契约 §8）。
+	RealitySNI string `json:"reality_sni"`
 }
 
 // NewLocalAPIServer 创建本地 API 服务
@@ -288,7 +291,12 @@ func (s *LocalAPIServer) generateVLESSUrl(u *local.LocalUser) string {
 	params.Set("encryption", "none")
 	params.Set("flow", "xtls-rprx-vision")
 	params.Set("security", "reality")
-	params.Set("sni", "www.microsoft.com") // 默认 SNI
+	// 取实际配置值，不写死（契约 §8）
+	sni := s.nodeConfig.RealitySNI
+	if sni == "" {
+		sni = "www.microsoft.com"
+	}
+	params.Set("sni", sni)
 	params.Set("fp", "chrome")
 	params.Set("pbk", s.nodeConfig.PublicKey)
 	params.Set("sid", s.nodeConfig.ShortID)
