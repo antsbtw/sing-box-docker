@@ -69,6 +69,8 @@ while [[ $# -gt 0 ]]; do
         --vless-port) VLESS_PORT="$2"; shift 2 ;;
         --management-mode) MANAGEMENT_MODE="$2"; shift 2 ;;
         --server-ip) SERVER_IP="$2"; shift 2 ;;
+        --with-singbox) WITH_SINGBOX=1; shift ;;
+        --no-singbox) WITH_SINGBOX=0; shift ;;
         --skip-checksum) SKIP_CHECKSUM=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -111,6 +113,25 @@ fi
 # ⚠️ 必须放在参数解析之后：放在前面的清理段里时 ENROLL_TOKEN 尚未赋值，判断恒假。
 if [ -n "$ENROLL_TOKEN" ]; then
     rm -f /opt/otun-agent/data/node.json 2>/dev/null || true
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 是否安装 sing-box
+#
+# agent 的职责是「把这台机器接到 App 上」,sing-box 只是接上之后
+# 装的第一个应用 —— 用户也可能想装别的,或者先不装。
+#
+# 默认值按接入方式分开,避免改坏存量:
+#   --api-key    存量路径,App 经 SSH 装完就指望 sing-box 在跑 → 默认装
+#   --enroll-token 新路径,装完由 App 经隧道按需安装 → 默认不装
+# 两条路径都可以用 --with-singbox / --no-singbox 显式覆盖。
+# ─────────────────────────────────────────────────────────────
+if [ -z "$WITH_SINGBOX" ]; then
+    if [ -n "$ENROLL_TOKEN" ]; then
+        WITH_SINGBOX=0
+    else
+        WITH_SINGBOX=1
+    fi
 fi
 
 echo -e "${YELLOW}Node ID: ${NODE_ID}${NC}"
@@ -199,22 +220,26 @@ esac
 # 不再提供"下载失败就从源码编译"的回退：那条路径绕过校验和，
 # 且编出来的二进制与 release 内的不是同一个，失去可复现性。
 # 下载或校验失败一律退出。
-case $ARCH in
-    x86_64) SINGBOX_ARCH="amd64" ;;
-    aarch64) SINGBOX_ARCH="arm64" ;;
-esac
+if [ "$WITH_SINGBOX" = "1" ]; then
+    case $ARCH in
+        x86_64) SINGBOX_ARCH="amd64" ;;
+        aarch64) SINGBOX_ARCH="arm64" ;;
+    esac
 
-download_verified "sing-box-linux-${SINGBOX_ARCH}" /usr/local/bin/sing-box
+    download_verified "sing-box-linux-${SINGBOX_ARCH}" /usr/local/bin/sing-box
 
-chmod +x /usr/local/bin/sing-box
-setcap cap_net_bind_service=+ep /usr/local/bin/sing-box
+    chmod +x /usr/local/bin/sing-box
+    setcap cap_net_bind_service=+ep /usr/local/bin/sing-box
 
-# 验证安装
-if ! sing-box version > /dev/null 2>&1; then
-    echo -e "${RED}sing-box installation verification failed${NC}"
-    exit 1
+    # 验证安装
+    if ! sing-box version > /dev/null 2>&1; then
+        echo -e "${RED}sing-box installation verification failed${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
+else
+    echo -e "${YELLOW}跳过 sing-box 安装（接入完成后可从 App 按需安装）${NC}"
 fi
-echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
 
 cd $INSTALL_DIR
 
@@ -231,16 +256,26 @@ chmod +x "$INSTALL_DIR/agent"
 
 # 创建数据目录
 mkdir -p $INSTALL_DIR/data
-mkdir -p /etc/sing-box
 
-# 创建初始配置
-cat > /etc/sing-box/config.json << 'CONF'
+if [ "$WITH_SINGBOX" = "1" ]; then
+    mkdir -p /etc/sing-box
+    # 创建初始配置
+    cat > /etc/sing-box/config.json << 'CONF'
 {
   "log": {"level": "info", "timestamp": true},
   "inbounds": [],
   "outbounds": [{"type": "direct", "tag": "direct"}]
 }
 CONF
+fi
+
+# 未安装 sing-box 时,agent 不要去拉一个不存在的二进制 ——
+# 否则每次启动都报错,且 /health 永远 503,装机闸口会误判为失败。
+if [ "$WITH_SINGBOX" = "1" ]; then
+    SKIP_SINGBOX_ENV="false"
+else
+    SKIP_SINGBOX_ENV="true"
+fi
 
 # 创建 systemd 服务
 cat > /etc/systemd/system/otun-agent.service << SYSTEMD
@@ -258,6 +293,7 @@ Environment="VLESS_PORT=$VLESS_PORT"
 Environment="OTUN_API_URL=$API_URL"
 Environment="MANAGEMENT_MODE=$MANAGEMENT_MODE"
 Environment="SERVER_IP=$SERVER_IP"
+Environment="SKIP_SINGBOX=$SKIP_SINGBOX_ENV"
 ExecStart=$INSTALL_DIR/agent
 Restart=always
 RestartSec=5
@@ -329,7 +365,8 @@ chmod +x /usr/local/bin/otun
 # 验不出服务能不能起来 —— 配置错误、端口被占、权限不足都会在这里暴露。
 # 没有这一道,用户会拿到一个"安装成功"但一个客户端都连不上的节点。
 #
-# /health 语义:200 = agent + sing-box 都在跑;503 = agent 在、sing-box 没起来。
+# /health 语义:200 = agent(以及装了的话 sing-box)在跑;503 = agent 在、sing-box 没起来。
+# 未安装 sing-box 时 unit 里带 SKIP_SINGBOX=true,agent 直接回 200。
 # 托管路径上 hosting-service 的 SSH 检查是第二道,两道都要。
 # ─────────────────────────────────────────────────────────────
 echo ""
@@ -365,7 +402,9 @@ echo -e "${GREEN}  Installation Complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
 echo -e "Node ID: ${YELLOW}$NODE_ID${NC}"
-echo -e "Config:  ${YELLOW}/etc/sing-box/config.json${NC}"
+if [ "$WITH_SINGBOX" = "1" ]; then
+    echo -e "Config:  ${YELLOW}/etc/sing-box/config.json${NC}"
+fi
 echo -e "Data:    ${YELLOW}$INSTALL_DIR/data${NC}"
 echo ""
 echo -e "Commands:"
@@ -373,5 +412,11 @@ echo -e "  ${YELLOW}otun status${NC}  - Check service status"
 echo -e "  ${YELLOW}otun logs${NC}    - View logs"
 echo -e "  ${YELLOW}otun restart${NC} - Restart service"
 echo ""
-echo -e "${GREEN}Secrets generated:${NC}"
-cat $INSTALL_DIR/data/secrets.json 2>/dev/null || echo "Will be generated on first run"
+
+if [ "$WITH_SINGBOX" = "1" ]; then
+    echo -e "${GREEN}Secrets generated:${NC}"
+    cat $INSTALL_DIR/data/secrets.json 2>/dev/null || echo "Will be generated on first run"
+else
+    echo -e "${GREEN}这台机器已接入,可以在 App 里管理了。${NC}"
+    echo -e "需要 VPN 服务时,从 App 上安装即可 —— 也可以装别的软件。"
+fi
