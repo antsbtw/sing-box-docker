@@ -48,7 +48,7 @@ echo -e "${GREEN}Cleanup completed${NC}"
 # 安装必要依赖
 echo -e "${GREEN}Installing dependencies...${NC}"
 apt-get update -qq
-apt-get install -y -qq git curl
+apt-get install -y -qq curl
 
 # 解析参数
 NODE_API_KEY=""
@@ -88,6 +88,29 @@ if [ -z "$NODE_API_KEY" ] && [ -z "$ENROLL_TOKEN" ]; then
     echo "Usage: $0 --enroll-token <token> --api-url <url>"
     echo "   or: $0 --api-key <key> [--node-id <id>] [--vless-port <port>] [--management-mode local|remote|hybrid] [--server-ip <ip>]"
     exit 1
+fi
+
+# H-2（契约 §2.2）：Token 模式下也必须有 NODE_API_KEY。
+# agent 的 main.go 在它为空时 log.Fatal，systemd 每 5s 重启一次，
+# 永远注册不上 —— 这条路径此前是走不通的。
+# 该密钥仅用于本机 /api/local/* 鉴权，不上报后端。
+if [ -n "$ENROLL_TOKEN" ] && [ -z "$NODE_API_KEY" ]; then
+    NODE_API_KEY=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    if [ -z "$NODE_API_KEY" ]; then
+        echo -e "${RED}无法生成本地 API 密钥（需要 openssl 或 /dev/urandom）${NC}"
+        exit 1
+    fi
+fi
+
+# H-3（契约 §2.4 第 0 步）：带 token 重装 = 总是重新注册。
+# 否则残留的 node.json 会让 agent 优先用旧 secret：
+# 用户在 App 里删过节点 → secret 已吊销 → 轮询 401 → agent 删 node.json 退出，
+# 而 install.sh 早因为「node.json 存在」把 token 行删了 —— 既无 token 又无 secret，卡死。
+# 后端按 machine_id 去重并轮换 secret，重复注册不会产生僵尸条目。
+#
+# ⚠️ 必须放在参数解析之后：放在前面的清理段里时 ENROLL_TOKEN 尚未赋值，判断恒假。
+if [ -n "$ENROLL_TOKEN" ]; then
+    rm -f /opt/otun-agent/data/node.json 2>/dev/null || true
 fi
 
 echo -e "${YELLOW}Node ID: ${NODE_ID}${NC}"
@@ -159,22 +182,17 @@ INSTALL_DIR="/opt/otun-agent"
 mkdir -p $INSTALL_DIR
 cd $INSTALL_DIR
 
-# 安装 Go (仅用于编译 agent)
-GO_VERSION="1.23.4"
-echo -e "${GREEN}Installing Go ${GO_VERSION}...${NC}"
-rm -rf /usr/local/go
+# 架构判定
+#
+# S-1：原先这里会下载安装 Go 1.23.4（70 MB），只为源码编译回退用。
+# 回退分支已移除，Go 不再有任何使用者 —— 它却会 rm -rf /usr/local/go
+# 抹掉用户自己装的 Go、改 /etc/profile、每次装机多 30 秒和一个 go.dev 依赖。
+# 已删除，仅保留下面的架构判定（后续两处下载都依赖 ARCH）。
 ARCH=$(uname -m)
 case $ARCH in
-    x86_64) GO_ARCH="amd64" ;;
-    aarch64) GO_ARCH="arm64" ;;
-    *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; exit 1 ;;
+    x86_64|aarch64) ;;
+    *) echo -e "${RED}不支持的架构: $ARCH（仅支持 x86_64 / aarch64）${NC}"; exit 1 ;;
 esac
-curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o go.tar.gz
-tar -C /usr/local -xzf go.tar.gz
-rm go.tar.gz
-export PATH=$PATH:/usr/local/go/bin
-grep -q '/usr/local/go/bin' /etc/profile || echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-echo -e "${GREEN}Go installed: $(go version)${NC}"
 
 # 下载 sing-box（本 release 内的官方源码构建版）
 #
@@ -243,6 +261,9 @@ Environment="SERVER_IP=$SERVER_IP"
 ExecStart=$INSTALL_DIR/agent
 Restart=always
 RestartSec=5
+# H-4（契约 §5.3）：收到 node_revoked 后 agent 以退出码 3 结束，
+# systemd 不得再拉起 —— 否则会每 5 秒去打一个已吊销的节点。
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=multi-user.target
@@ -268,7 +289,22 @@ if [ -n "$ENROLL_TOKEN" ]; then
         sleep 2
     done
     if [ ! -f "$INSTALL_DIR/data/node.json" ]; then
-        echo -e "${YELLOW}⚠️  注册尚未完成，请查看: journalctl -u otun-agent -n 50${NC}"
+        # H-1（契约 §2.4 第 4 条）：必须 exit 1。
+        # 此前只打一行警告就继续往下跑健康闸口，而 sing-box 空配置也能起来、
+        # /health 返回 200，脚本末尾照样打印「Installation Complete!」——
+        # token 过期或 agent_too_old 时用户看到"成功"，App 里却永远没有节点。
+        echo ""
+        echo -e "${RED}✗ 节点注册失败（60 秒内未完成）${NC}"
+        echo ""
+        echo -e "${YELLOW}--- agent 日志 ---${NC}"
+        journalctl -u otun-agent -n 30 --no-pager 2>/dev/null || echo "(无日志)"
+        echo ""
+        echo -e "${YELLOW}常见原因:${NC}"
+        echo -e "${YELLOW}  · token 已过期（有效期 15 分钟）—— 回 App 重新获取安装命令${NC}"
+        echo -e "${YELLOW}  · token 已被使用过 —— 每个 token 只能用一次${NC}"
+        echo -e "${YELLOW}  · 这台服务器访问不了 ${API_URL}${NC}"
+        echo ""
+        exit 1
     fi
 fi
 
@@ -314,12 +350,10 @@ done
 if [ "$HEALTH_OK" != "1" ]; then
     echo -e "${RED}✗ 服务未能在 30 秒内就绪(最后状态码: ${CODE})${NC}"
     echo ""
-    echo -e "${YELLOW}--- sing-box 最近日志 ---${NC}"
-    journalctl -u sing-box -n 30 --no-pager 2>/dev/null || \
-        tail -30 /var/log/sing-box.log 2>/dev/null || echo "(无日志)"
-    echo ""
-    echo -e "${YELLOW}--- agent 最近日志 ---${NC}"
-    journalctl -u otun-agent -n 30 --no-pager 2>/dev/null || echo "(无日志)"
+    # sing-box 由 agent 作为子进程拉起，没有独立的 systemd unit，
+    # 它的输出在 agent 日志里（S-2）。
+    echo -e "${YELLOW}--- agent 与 sing-box 日志 ---${NC}"
+    journalctl -u otun-agent -n 40 --no-pager 2>/dev/null || echo "(无日志)"
     echo ""
     echo -e "${RED}安装未完成。排查后可重跑本脚本。${NC}"
     exit 1
