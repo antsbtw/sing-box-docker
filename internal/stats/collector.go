@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -56,14 +57,38 @@ func (c *Collector) Collect() (map[string]*UserStats, error) {
 		return nil, fmt.Errorf("decode stats: %w", err)
 	}
 
-	// 解析统计数据
-	// 格式: user>>>uuid>>>traffic>>>uplink/downlink
+	// 解析统计数据。
+	//
+	// sing-box 的 v2ray_api 以 ">>>" 分段给出计数器名：
+	//     user>>>{uuid}>>>traffic>>>uplink
+	//     user>>>{uuid}>>>traffic>>>downlink
+	//
+	// ⚠️ 此前这里只建空对象、从不赋值，所有用户的 up/down 恒为 0 ——
+	// 接入契约 §5.1 的 stats[] 全靠它，不修则后端永远收到 0。
 	stats := make(map[string]*UserStats)
 
 	for _, stat := range result.Stat {
-		// 简化解析，实际格式可能需要调整
-		if _, ok := stats[stat.Name]; !ok {
-			stats[stat.Name] = &UserStats{}
+		parts := strings.Split(stat.Name, ">>>")
+		// 形如 [user, <uuid>, traffic, uplink]
+		if len(parts) != 4 || parts[0] != "user" || parts[2] != "traffic" {
+			continue
+		}
+		uuid := parts[1]
+		if uuid == "" {
+			continue
+		}
+
+		us, ok := stats[uuid]
+		if !ok {
+			us = &UserStats{}
+			stats[uuid] = us
+		}
+
+		switch parts[3] {
+		case "uplink":
+			us.Upload = stat.Value
+		case "downlink":
+			us.Download = stat.Value
 		}
 	}
 

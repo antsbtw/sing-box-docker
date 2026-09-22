@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -32,6 +33,10 @@ type LocalUsersData struct {
 	Version string      `json:"version"`
 	Users   []LocalUser `json:"users"`
 }
+
+// ErrUserConflict：uuid 已存在但字段与请求不一致。
+// 契约 §6.4 要求据此回 failed user_exists，而不是覆盖用户数据。
+var ErrUserConflict = errors.New("user exists with different attributes")
 
 // Store 本地用户存储管理
 type Store struct {
@@ -156,6 +161,78 @@ func (s *Store) CreateUser(req *CreateUserRequest) (*LocalUser, error) {
 	}
 
 	return user, nil
+}
+
+// UpsertUser 用**调用方给定**的 uuid 与 ss_password 写入用户。
+//
+// 与 CreateUser 的区别：后者自己生成 uuid 和密码，而 Token 模式下这两项
+// 由后端决定（接线契约 §6.2：「uuid 与 ss_password 用后端给的，不自生成」）——
+// 后端要用同样的值拼分享链接，两边必须一致。
+//
+// 幂等（契约 §6.4）：uuid 已存在且关键字段一致 → 返回 (user, false, nil)，
+// 视为成功；不一致 → 返回 ErrUserConflict，由调用方回 failed user_exists。
+// 后端在回执丢失时会重投，不能因此报错。
+func (s *Store) UpsertUser(u *LocalUser) (*LocalUser, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if u.UUID == "" {
+		return nil, false, fmt.Errorf("uuid is required")
+	}
+
+	if existing, ok := s.users[u.UUID]; ok {
+		if existing.SSPassword != u.SSPassword || existing.Name != u.Name {
+			return nil, false, ErrUserConflict
+		}
+		return existing, false, nil // 重复投递，已是目标状态
+	}
+
+	protocols := u.Protocols
+	if len(protocols) == 0 {
+		protocols = []string{"vless", "shadowsocks"}
+	}
+
+	now := time.Now()
+	user := &LocalUser{
+		UUID:         u.UUID,
+		Name:         u.Name,
+		Protocols:    protocols,
+		SSPassword:   u.SSPassword,
+		Enabled:      u.Enabled,
+		TrafficLimit: u.TrafficLimit,
+		TrafficUsed:  0,
+		ExpireAt:     u.ExpireAt,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	s.users[user.UUID] = user
+
+	if err := s.save(); err != nil {
+		delete(s.users, user.UUID)
+		return nil, false, fmt.Errorf("save users: %w", err)
+	}
+
+	if s.onChange != nil {
+		go s.onChange()
+	}
+	return user, true, nil
+}
+
+// ResetTraffic 把本地累计用量归零。
+//
+// ⚠️ 只动本地计数（用于配额判定），**不影响** stats 上报的值 ——
+// 那是 sing-box 自己的计数器，agent 不碰（契约 §6.2 reset_user_traffic）。
+func (s *Store) ResetTraffic(uuid string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	user, ok := s.users[uuid]
+	if !ok {
+		return fmt.Errorf("user not found: %s", uuid)
+	}
+	user.TrafficUsed = 0
+	user.UpdatedAt = time.Now()
+	return s.save()
 }
 
 // GetUser 获取单个用户

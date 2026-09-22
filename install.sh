@@ -48,7 +48,7 @@ echo -e "${GREEN}Cleanup completed${NC}"
 # 安装必要依赖
 echo -e "${GREEN}Installing dependencies...${NC}"
 apt-get update -qq
-apt-get install -y -qq git curl
+apt-get install -y -qq curl
 
 # 解析参数
 NODE_API_KEY=""
@@ -63,81 +63,148 @@ API_URL="https://otun-manager.situstechnologies.com"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --api-key) NODE_API_KEY="$2"; shift 2 ;;
+        --enroll-token) ENROLL_TOKEN="$2"; shift 2 ;;
         --node-id) NODE_ID="$2"; shift 2 ;;
         --api-url) API_URL="$2"; shift 2 ;;
         --vless-port) VLESS_PORT="$2"; shift 2 ;;
         --management-mode) MANAGEMENT_MODE="$2"; shift 2 ;;
         --server-ip) SERVER_IP="$2"; shift 2 ;;
+        --skip-checksum) SKIP_CHECKSUM=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
-if [ -z "$NODE_API_KEY" ]; then
-    echo -e "${RED}Error: --api-key is required${NC}"
-    echo "Usage: $0 --api-key <key> [--node-id <id>] [--vless-port <port>] [--management-mode local|remote|hybrid] [--server-ip <ip>]"
+# 两种接入方式二选一：
+#   --api-key      旧路径。App 经 SSH 直接安装，密钥由 App 生成，后端无记录。
+#                  存量节点全靠这条，**不可移除**。
+#   --enroll-token 新路径。用户从官网取一次性 token，agent 注册后主动外连。
+if [ -n "$ENROLL_TOKEN" ] && [ -n "$NODE_API_KEY" ]; then
+    echo -e "${RED}Error: --enroll-token 与 --api-key 只能二选一${NC}"
     exit 1
+fi
+
+if [ -z "$NODE_API_KEY" ] && [ -z "$ENROLL_TOKEN" ]; then
+    echo -e "${RED}Error: 需要 --api-key 或 --enroll-token${NC}"
+    echo "Usage: $0 --enroll-token <token> --api-url <url>"
+    echo "   or: $0 --api-key <key> [--node-id <id>] [--vless-port <port>] [--management-mode local|remote|hybrid] [--server-ip <ip>]"
+    exit 1
+fi
+
+# H-2（契约 §2.2）：Token 模式下也必须有 NODE_API_KEY。
+# agent 的 main.go 在它为空时 log.Fatal，systemd 每 5s 重启一次，
+# 永远注册不上 —— 这条路径此前是走不通的。
+# 该密钥仅用于本机 /api/local/* 鉴权，不上报后端。
+if [ -n "$ENROLL_TOKEN" ] && [ -z "$NODE_API_KEY" ]; then
+    NODE_API_KEY=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    if [ -z "$NODE_API_KEY" ]; then
+        echo -e "${RED}无法生成本地 API 密钥（需要 openssl 或 /dev/urandom）${NC}"
+        exit 1
+    fi
+fi
+
+# H-3（契约 §2.4 第 0 步）：带 token 重装 = 总是重新注册。
+# 否则残留的 node.json 会让 agent 优先用旧 secret：
+# 用户在 App 里删过节点 → secret 已吊销 → 轮询 401 → agent 删 node.json 退出，
+# 而 install.sh 早因为「node.json 存在」把 token 行删了 —— 既无 token 又无 secret，卡死。
+# 后端按 machine_id 去重并轮换 secret，重复注册不会产生僵尸条目。
+#
+# ⚠️ 必须放在参数解析之后：放在前面的清理段里时 ENROLL_TOKEN 尚未赋值，判断恒假。
+if [ -n "$ENROLL_TOKEN" ]; then
+    rm -f /opt/otun-agent/data/node.json 2>/dev/null || true
 fi
 
 echo -e "${YELLOW}Node ID: ${NODE_ID}${NC}"
 echo -e "${YELLOW}VLESS Port: ${VLESS_PORT}${NC}"
 echo -e "${YELLOW}Management Mode: ${MANAGEMENT_MODE}${NC}"
 
+# ─────────────────────────────────────────────────────────────
+# 版本与完整性校验
+#
+# ⚠️ RELEASE_TAG 由 CI 在发版时替换为实际 tag。
+# 三件二进制全部取自同一个 release —— 此前 agent 走浮动 latest、
+# sing-box 钉版本，两者可能来自不同时间的构建，2026-08-31 事故即源于此。
+# ─────────────────────────────────────────────────────────────
+RELEASE_TAG="${RELEASE_TAG:-__RELEASE_TAG__}"
+REPO="antsbtw/sing-box-docker"
+RELEASE_BASE="https://github.com/${REPO}/releases/download/${RELEASE_TAG}"
+
+# 下载并校验。校验失败即退出 —— 宁可装不上，也不装一个来路不明的二进制。
+download_verified() {
+    local name="$1" dest="$2"
+    echo -e "${YELLOW}Downloading ${name}...${NC}"
+    if ! curl -fsSL "${RELEASE_BASE}/${name}" -o "$dest"; then
+        echo -e "${RED}✗ 下载失败${NC}"
+        echo -e "${RED}  地址: ${RELEASE_BASE}/${name}${NC}"
+        echo -e "${YELLOW}  可能原因:${NC}"
+        echo -e "${YELLOW}    1. 这台服务器访问不了 GitHub —— 检查出网与 DNS${NC}"
+        echo -e "${YELLOW}       curl -I https://github.com${NC}"
+        echo -e "${YELLOW}    2. release ${RELEASE_TAG} 不存在或资产缺失${NC}"
+        echo -e "${YELLOW}  网络恢复后重跑本脚本即可，不会留下半成品。${NC}"
+        exit 1
+    fi
+    if [ "${SKIP_CHECKSUM:-0}" = "1" ]; then
+        echo -e "${YELLOW}⚠️  已跳过校验和验证（--skip-checksum）${NC}"
+        return 0
+    fi
+    local want
+    want=$(grep " ${name}\$" "$SHA256SUMS_FILE" | awk '{print $1}')
+    if [ -z "$want" ]; then
+        echo -e "${RED}SHA256SUMS 中找不到 ${name} 的校验和${NC}"
+        exit 1
+    fi
+    local got
+    got=$(sha256sum "$dest" | awk '{print $1}')
+    if [ "$want" != "$got" ]; then
+        echo -e "${RED}校验和不匹配: ${name}${NC}"
+        echo -e "${RED}  期望: ${want}${NC}"
+        echo -e "${RED}  实际: ${got}${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ ${name} 校验通过${NC}"
+}
+
+SHA256SUMS_FILE="/tmp/otun-SHA256SUMS.$$"
+trap 'rm -f "$SHA256SUMS_FILE"' EXIT
+
+if [ "${SKIP_CHECKSUM:-0}" != "1" ]; then
+    if ! curl -fsSL "${RELEASE_BASE}/SHA256SUMS" -o "$SHA256SUMS_FILE"; then
+        echo -e "${RED}✗ 无法下载校验和文件 SHA256SUMS${NC}"
+        echo -e "${RED}  地址: ${RELEASE_BASE}/SHA256SUMS${NC}"
+        echo -e "${YELLOW}  这台服务器可能访问不了 GitHub。先确认出网:${NC}"
+        echo -e "${YELLOW}    curl -I https://github.com${NC}"
+        echo -e "${YELLOW}  确需跳过校验（不推荐）可加 --skip-checksum${NC}"
+        exit 1
+    fi
+fi
+
 # 安装目录
 INSTALL_DIR="/opt/otun-agent"
 mkdir -p $INSTALL_DIR
 cd $INSTALL_DIR
 
-# 安装 Go (仅用于编译 agent)
-GO_VERSION="1.23.4"
-echo -e "${GREEN}Installing Go ${GO_VERSION}...${NC}"
-rm -rf /usr/local/go
+# 架构判定
+#
+# S-1：原先这里会下载安装 Go 1.23.4（70 MB），只为源码编译回退用。
+# 回退分支已移除，Go 不再有任何使用者 —— 它却会 rm -rf /usr/local/go
+# 抹掉用户自己装的 Go、改 /etc/profile、每次装机多 30 秒和一个 go.dev 依赖。
+# 已删除，仅保留下面的架构判定（后续两处下载都依赖 ARCH）。
 ARCH=$(uname -m)
 case $ARCH in
-    x86_64) GO_ARCH="amd64" ;;
-    aarch64) GO_ARCH="arm64" ;;
-    *) echo -e "${RED}Unsupported architecture: $ARCH${NC}"; exit 1 ;;
+    x86_64|aarch64) ;;
+    *) echo -e "${RED}不支持的架构: $ARCH（仅支持 x86_64 / aarch64）${NC}"; exit 1 ;;
 esac
-curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${GO_ARCH}.tar.gz" -o go.tar.gz
-tar -C /usr/local -xzf go.tar.gz
-rm go.tar.gz
-export PATH=$PATH:/usr/local/go/bin
-grep -q '/usr/local/go/bin' /etc/profile || echo 'export PATH=$PATH:/usr/local/go/bin' >> /etc/profile
-echo -e "${GREEN}Go installed: $(go version)${NC}"
 
-# 下载预编译的 sing-box (已包含 v2ray_api 和 utls 支持)
-echo -e "${GREEN}Downloading pre-built sing-box with v2ray_api support...${NC}"
-
-# sing-box 版本和预编译二进制下载地址
-SINGBOX_VERSION="1.10.7"
-
-# 确定架构
+# 下载 sing-box（本 release 内的官方源码构建版）
+#
+# 不再提供"下载失败就从源码编译"的回退：那条路径绕过校验和，
+# 且编出来的二进制与 release 内的不是同一个，失去可复现性。
+# 下载或校验失败一律退出。
 case $ARCH in
     x86_64) SINGBOX_ARCH="amd64" ;;
     aarch64) SINGBOX_ARCH="arm64" ;;
 esac
 
-# 从 GitHub Release 下载预编译二进制文件
-# 这个二进制文件由项目维护者预编译，包含 with_v2ray_api,with_utls 标签
-SINGBOX_URL="https://github.com/antsbtw/sing-box-docker/releases/download/v${SINGBOX_VERSION}/sing-box-linux-${SINGBOX_ARCH}"
-
-echo -e "${YELLOW}Downloading sing-box v${SINGBOX_VERSION} for ${SINGBOX_ARCH}...${NC}"
-if ! curl -fsSL "$SINGBOX_URL" -o /usr/local/bin/sing-box; then
-    echo -e "${RED}Failed to download sing-box from ${SINGBOX_URL}${NC}"
-    echo -e "${YELLOW}Falling back to source compilation...${NC}"
-
-    # 备用方案：从源码编译
-    cd /tmp
-    rm -rf sing-box-src
-    git clone --depth 1 --branch "v${SINGBOX_VERSION}" https://github.com/SagerNet/sing-box.git sing-box-src
-    cd sing-box-src
-    if ! go build -tags "with_v2ray_api,with_utls,with_reality_server" -o sing-box ./cmd/sing-box; then
-        echo -e "${RED}Failed to build sing-box${NC}"
-        cd /tmp && rm -rf sing-box-src
-        exit 1
-    fi
-    mv sing-box /usr/local/bin/
-    cd /tmp && rm -rf sing-box-src
-fi
+download_verified "sing-box-linux-${SINGBOX_ARCH}" /usr/local/bin/sing-box
 
 chmod +x /usr/local/bin/sing-box
 setcap cap_net_bind_service=+ep /usr/local/bin/sing-box
@@ -151,48 +218,16 @@ echo -e "${GREEN}sing-box installed: $(sing-box version | head -1)${NC}"
 
 cd $INSTALL_DIR
 
-# 下载预编译的 agent
-echo -e "${GREEN}Downloading OTun Node Agent...${NC}"
-
-# 确定架构
+# 下载 agent（同一 release，与 sing-box 必然同源）
 case $ARCH in
     x86_64) AGENT_ARCH="amd64" ;;
     aarch64) AGENT_ARCH="arm64" ;;
 esac
 
-# 从 GitHub Release 下载预编译的 agent
-AGENT_URL="https://github.com/antsbtw/sing-box-docker/releases/download/latest/agent-linux-${AGENT_ARCH}"
+download_verified "agent-linux-${AGENT_ARCH}" "$INSTALL_DIR/agent"
+chmod +x "$INSTALL_DIR/agent"
 
-echo -e "${YELLOW}Downloading agent for ${AGENT_ARCH}...${NC}"
-if curl -fsSL "$AGENT_URL" -o $INSTALL_DIR/agent; then
-    chmod +x $INSTALL_DIR/agent
-    echo -e "${GREEN}Agent downloaded successfully${NC}"
-else
-    echo -e "${YELLOW}Download failed, falling back to source compilation...${NC}"
 
-    # 备用方案：从源码编译
-    if [ -d "repo" ]; then
-        cd repo
-        git fetch origin
-        git reset --hard origin/main
-    else
-        git clone https://github.com/antsbtw/sing-box-docker.git repo
-        cd repo
-    fi
-
-    echo -e "${GREEN}Building agent from source...${NC}"
-    if ! go build -o $INSTALL_DIR/agent ./cmd/agent; then
-        echo -e "${RED}Failed to build agent${NC}"
-        exit 1
-    fi
-    cd $INSTALL_DIR
-fi
-
-if [ ! -f "$INSTALL_DIR/agent" ]; then
-    echo -e "${RED}Agent binary not found${NC}"
-    exit 1
-fi
-echo -e "${GREEN}Agent ready${NC}"
 
 # 创建数据目录
 mkdir -p $INSTALL_DIR/data
@@ -217,6 +252,7 @@ After=network.target
 Type=simple
 WorkingDirectory=$INSTALL_DIR
 Environment="NODE_API_KEY=$NODE_API_KEY"
+Environment="OTUN_ENROLL_TOKEN=$ENROLL_TOKEN"
 Environment="NODE_ID=$NODE_ID"
 Environment="VLESS_PORT=$VLESS_PORT"
 Environment="OTUN_API_URL=$API_URL"
@@ -225,6 +261,9 @@ Environment="SERVER_IP=$SERVER_IP"
 ExecStart=$INSTALL_DIR/agent
 Restart=always
 RestartSec=5
+# H-4（契约 §5.3）：收到 node_revoked 后 agent 以退出码 3 结束，
+# systemd 不得再拉起 —— 否则会每 5 秒去打一个已吊销的节点。
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=multi-user.target
@@ -234,6 +273,40 @@ SYSTEMD
 systemctl daemon-reload
 systemctl enable otun-agent
 systemctl start otun-agent
+
+# ⚠️ token 只用于首次注册：agent 注册成功后写入 node.json 并持久化
+# node_secret，此后不再需要 token。这里从 systemd 单元里移除它，
+# 避免一次性凭据长期留在磁盘上（systemd 单元是 0644，任何用户可读）。
+if [ -n "$ENROLL_TOKEN" ]; then
+    echo -e "${YELLOW}等待节点注册...${NC}"
+    for _ in $(seq 1 30); do
+        if [ -f "$INSTALL_DIR/data/node.json" ]; then
+            sed -i '/OTUN_ENROLL_TOKEN/d' /etc/systemd/system/otun-agent.service
+            systemctl daemon-reload
+            echo -e "${GREEN}✓ 注册成功，已清除一次性 token${NC}"
+            break
+        fi
+        sleep 2
+    done
+    if [ ! -f "$INSTALL_DIR/data/node.json" ]; then
+        # H-1（契约 §2.4 第 4 条）：必须 exit 1。
+        # 此前只打一行警告就继续往下跑健康闸口，而 sing-box 空配置也能起来、
+        # /health 返回 200，脚本末尾照样打印「Installation Complete!」——
+        # token 过期或 agent_too_old 时用户看到"成功"，App 里却永远没有节点。
+        echo ""
+        echo -e "${RED}✗ 节点注册失败（60 秒内未完成）${NC}"
+        echo ""
+        echo -e "${YELLOW}--- agent 日志 ---${NC}"
+        journalctl -u otun-agent -n 30 --no-pager 2>/dev/null || echo "(无日志)"
+        echo ""
+        echo -e "${YELLOW}常见原因:${NC}"
+        echo -e "${YELLOW}  · token 已过期（有效期 15 分钟）—— 回 App 重新获取安装命令${NC}"
+        echo -e "${YELLOW}  · token 已被使用过 —— 每个 token 只能用一次${NC}"
+        echo -e "${YELLOW}  · 这台服务器访问不了 ${API_URL}${NC}"
+        echo ""
+        exit 1
+    fi
+fi
 
 # 创建管理命令
 cat > /usr/local/bin/otun << 'CMD'
@@ -248,6 +321,43 @@ case "$1" in
 esac
 CMD
 chmod +x /usr/local/bin/otun
+
+# ─────────────────────────────────────────────────────────────
+# 数据面闸口(接线契约 §2.5、实施单 §7.7)
+#
+# ⚠️ 这是第一道闸口。前面的 `sing-box version` 只验二进制可执行,
+# 验不出服务能不能起来 —— 配置错误、端口被占、权限不足都会在这里暴露。
+# 没有这一道,用户会拿到一个"安装成功"但一个客户端都连不上的节点。
+#
+# /health 语义:200 = agent + sing-box 都在跑;503 = agent 在、sing-box 没起来。
+# 托管路径上 hosting-service 的 SSH 检查是第二道,两道都要。
+# ─────────────────────────────────────────────────────────────
+echo ""
+echo -e "${YELLOW}检查服务健康状态...${NC}"
+HEALTH_OK=0
+for i in $(seq 1 6); do
+    # curl 失败时 -w 仍会输出 000，与 || echo 叠加会变成 000000，故取末三位
+    CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://localhost:8080/health 2>/dev/null)
+    CODE="${CODE:-000}"; CODE="${CODE: -3}"
+    if [ "$CODE" = "200" ]; then
+        HEALTH_OK=1
+        echo -e "${GREEN}✓ 服务已就绪${NC}"
+        break
+    fi
+    [ $i -lt 6 ] && sleep 5
+done
+
+if [ "$HEALTH_OK" != "1" ]; then
+    echo -e "${RED}✗ 服务未能在 30 秒内就绪(最后状态码: ${CODE})${NC}"
+    echo ""
+    # sing-box 由 agent 作为子进程拉起，没有独立的 systemd unit，
+    # 它的输出在 agent 日志里（S-2）。
+    echo -e "${YELLOW}--- agent 与 sing-box 日志 ---${NC}"
+    journalctl -u otun-agent -n 40 --no-pager 2>/dev/null || echo "(无日志)"
+    echo ""
+    echo -e "${RED}安装未完成。排查后可重跑本脚本。${NC}"
+    exit 1
+fi
 
 echo ""
 echo -e "${GREEN}========================================${NC}"

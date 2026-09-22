@@ -28,18 +28,19 @@ type AgentConfig struct {
 	LogLevel       string
 	ManagementMode ManagementMode // 管理模式
 	ServerIP       string         // 服务器公网 IP（用于生成连接 URL）
+	RealitySNI     string
 }
 
 // User 是从管理服务器获取的用户信息
 type User struct {
-	UUID          string     `json:"uuid"`
-	Protocols     []string   `json:"protocols"`
-	SSPassword    string     `json:"ss_password"`
-	Enabled       bool       `json:"enabled"`
-	TrafficLimit  int64      `json:"traffic_limit"`
-	TrafficUsed   int64      `json:"traffic_used"`
-	ExpireAt      *time.Time `json:"expire_at"`
-	DeviceID      string     `json:"device_id"`       // 绑定的设备指纹
+	UUID         string     `json:"uuid"`
+	Protocols    []string   `json:"protocols"`
+	SSPassword   string     `json:"ss_password"`
+	Enabled      bool       `json:"enabled"`
+	TrafficLimit int64      `json:"traffic_limit"`
+	TrafficUsed  int64      `json:"traffic_used"`
+	ExpireAt     *time.Time `json:"expire_at"`
+	DeviceID     string     `json:"device_id"` // 绑定的设备指纹
 }
 
 // UsersResponse 是管理服务器返回的用户列表
@@ -99,6 +100,6 @@ type NodeLoad struct {
 // HeartbeatResponse 心跳响应
 type HeartbeatResponse struct {
 	OK          bool     `json:"ok"`
-	KickUsers   []string `json:"kick_users"`    // 需要踢掉的用户
-	ReloadUsers bool     `json:"reload_users"`  // 是否需要重新拉取用户列表
+	KickUsers   []string `json:"kick_users"`   // 需要踢掉的用户
+	ReloadUsers bool     `json:"reload_users"` // 是否需要重新拉取用户列表
 }

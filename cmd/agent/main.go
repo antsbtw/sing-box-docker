@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"sync"
@@ -14,30 +16,42 @@ import (
 
 	"otun-node-agent/internal/api"
 	"otun-node-agent/internal/config"
+	"otun-node-agent/internal/enroll"
 	"otun-node-agent/internal/local"
 	"otun-node-agent/internal/quota"
 	"otun-node-agent/internal/singbox"
 	"otun-node-agent/internal/stats"
 )
 
+// Version 由构建时注入：go build -ldflags "-X main.Version=v1.11.0"
+//
+// ⚠️ 不要改名或移动：CI(.github/workflows/release.yml)按此路径注入，
+// 注册请求的 agent_version 用它，后端据此做 agent_too_old 判定
+// （接线契约 §4.1）。未注入时为 dev，后端会拒绝注册。
+var Version = "dev"
+
 // Agent 是主控制器
 type Agent struct {
-	cfg        *config.AgentConfig
-	secrets    *config.NodeSecrets
-	syncer     *config.Syncer
-	cache      *config.Cache
-	generator  *config.Generator
-	manager    *singbox.Manager
-	connMgr    *singbox.ConnectionManager
-	monitor    *quota.Monitor
-	collector  *stats.Collector
-	reporter   *stats.Reporter
+	cfg       *config.AgentConfig
+	secrets   *config.NodeSecrets
+	syncer    *config.Syncer
+	cache     *config.Cache
+	generator *config.Generator
+	manager   *singbox.Manager
+	connMgr   *singbox.ConnectionManager
+	monitor   *quota.Monitor
+	collector *stats.Collector
+	reporter  *stats.Reporter
 
 	// 本地用户管理
 	localStore *local.Store
 	localAPI   *api.LocalAPIServer
 
+	// Token 接入（外连模式）。nil 表示走存量 API-Key 路径。
+	enrollRunner *enroll.Runner
+
 	currentVersion string
+	revoked        bool
 	mu             sync.RWMutex
 }
 
@@ -81,6 +95,14 @@ func main() {
 
 	// 启动 Agent
 	agent.Run(ctx)
+
+	// 节点被后端解绑：停服、清凭据，并以约定退出码结束。
+	// systemd 单元配了 RestartPreventExitStatus=3，据此不再拉起 ——
+	// 否则会每 5 秒去打一个已吊销的节点（接线契约 §5.3）。
+	if agent.revoked {
+		log.Println("节点已解绑，agent 退出且不再重启")
+		os.Exit(enroll.ExitRevoked)
+	}
 }
 
 // NewAgent 创建新的 Agent 实例
@@ -153,13 +175,14 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 
 		// 创建本地 API 服务
 		nodeConfig := &api.NodeConfig{
-			NodeID:    cfg.NodeID,
-			ServerIP:  cfg.ServerIP,
-			PublicKey: secrets.PublicKey,
-			ShortID:   secrets.ShortIDs[0],
-			VLESSPort: cfg.VLESSPort,
-			SSPort:    ssPort,
-			SSMethod:  "chacha20-ietf-poly1305",
+			NodeID:     cfg.NodeID,
+			ServerIP:   cfg.ServerIP,
+			PublicKey:  secrets.PublicKey,
+			ShortID:    secrets.ShortIDs[0],
+			VLESSPort:  cfg.VLESSPort,
+			SSPort:     ssPort,
+			SSMethod:   "chacha20-ietf-poly1305",
+			RealitySNI: cfg.RealitySNI,
 		}
 		agent.localAPI = api.NewLocalAPIServer(agent.localStore, cfg.NodeAPIKey, nodeConfig)
 
@@ -185,6 +208,15 @@ func (a *Agent) Run(ctx context.Context) {
 		// 本地模式：只使用本地用户
 		log.Println("Running in LOCAL mode")
 		a.initLocalMode()
+
+		// Token 接入：额外起一条到后端的长轮询通道。
+		//
+		// 它与本地用户管理并存 —— 指令最终也是落到同一个 local.Store，
+		// 所以存量的 /api/local/* 与新的后端下发不会打架。
+		// 未配置 token 且无 node.json 时静默跳过，存量节点行为不变。
+		if err := a.startEnrollment(ctx); err != nil {
+			log.Printf("[enroll] 未启用 Token 接入: %v", err)
+		}
 
 	case config.ModeRemote:
 		// 远程模式：与原来行为一致
@@ -389,7 +421,7 @@ func (a *Agent) regenerateConfig() {
 	a.monitor.UpdateUsers(users)
 
 	// 生成配置
-	singboxCfg := a.generator.Generate(users, "www.microsoft.com")
+	singboxCfg := a.generator.Generate(users, a.cfg.RealitySNI)
 
 	if err := a.generator.WriteToFile(singboxCfg, a.cfg.SingboxConfig); err != nil {
 		log.Printf("Failed to write config: %v", err)
@@ -675,4 +707,130 @@ func (a *Agent) collectAndReport() {
 			}
 		}
 	}
+}
+
+// ── Token 接入（接线契约 §2、§4、§5）────────────────────────
+
+// nodeInfo 把 Agent 已有的状态暴露给 enroll 包，避免它反向依赖 main。
+type nodeInfo struct{ a *Agent }
+
+func (n nodeInfo) ListenPorts() map[string]int {
+	ports := map[string]int{"vless": n.a.cfg.VLESSPort}
+	if p := n.a.effectiveSSPort(); p > 0 {
+		ports["ss"] = p
+	}
+	return ports
+}
+
+func (n nodeInfo) Secrets() enroll.NodeSecrets {
+	return enroll.NodeSecrets{
+		RealityPublicKey: n.a.secrets.PublicKey,
+		ShortIDs:         n.a.secrets.ShortIDs,
+		// 与配置生成器同一来源，不写死（契约 §8）
+		RealitySNI: n.a.cfg.RealitySNI,
+		SSMethod:   "chacha20-ietf-poly1305",
+	}
+}
+
+func (n nodeInfo) SingboxVersion() string { return n.a.singboxVersion() }
+
+// statsAdapter 把 stats.Collector 的输出转成契约定义的形状。
+type statsAdapter struct{ c *stats.Collector }
+
+func (s statsAdapter) Collect() (map[string]enroll.UserStat, error) {
+	raw, err := s.c.Collect()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]enroll.UserStat, len(raw))
+	for uuid, st := range raw {
+		// 累计值原样上报，不做差、不清零（契约 §5.1、§7）
+		out[uuid] = enroll.UserStat{UUID: uuid, Up: st.Upload, Down: st.Download}
+	}
+	return out, nil
+}
+
+type storeAdapter struct{ s *local.Store }
+
+func (s storeAdapter) UserCount() int {
+	if s.s == nil {
+		return 0
+	}
+	return s.s.GetUserCount()
+}
+
+// startEnrollment 在有 token 或已接入时启动长轮询通道。
+func (a *Agent) startEnrollment(ctx context.Context) error {
+	dataDir := "./data"
+	token := os.Getenv("OTUN_ENROLL_TOKEN")
+
+	// 既无 token 也未接入 → 存量 API-Key 路径，什么都不做
+	existing, _ := enroll.LoadNodeFile(dataDir)
+	if token == "" && existing == nil {
+		return errors.New("未配置 OTUN_ENROLL_TOKEN 且未接入")
+	}
+
+	info := nodeInfo{a: a}
+	runner := &enroll.Runner{
+		DataDir:        dataDir,
+		APIURL:         a.cfg.APIURL,
+		AgentVersion:   Version,
+		Token:          token,
+		Client:         enroll.NewClient(a.cfg.APIURL, Version),
+		Executor:       enroll.NewExecutor(a.localStore, info, Version, a.reloadForCommand),
+		Info:           info,
+		Stats:          statsAdapter{c: a.collector},
+		Store:          storeAdapter{s: a.localStore},
+		SingboxRunning: a.manager.IsRunning,
+	}
+
+	if err := runner.Prepare(ctx); err != nil {
+		return err
+	}
+	a.enrollRunner = runner
+
+	go func() {
+		err := runner.Run(ctx)
+		if errors.Is(err, enroll.ErrRevoked) {
+			// 终态：停数据面、清本地凭据，标记让 main 以退出码 3 结束
+			log.Println("[enroll] 收到解绑指令，停止 sing-box")
+			_ = a.manager.Stop()
+			runner.Cleanup()
+			a.mu.Lock()
+			a.revoked = true
+			a.mu.Unlock()
+		}
+	}()
+	return nil
+}
+
+// reloadForCommand 供 reload 指令调用：重新生成配置并应用。
+func (a *Agent) reloadForCommand() error {
+	a.regenerateConfig()
+	return nil
+}
+
+// effectiveSSPort 返回实际监听的 SS 端口（可能是随机分配的）。
+func (a *Agent) effectiveSSPort() int {
+	if a.cfg.SSPort != 8388 {
+		return a.cfg.SSPort
+	}
+	if a.secrets != nil {
+		return a.secrets.SSPort
+	}
+	return a.cfg.SSPort
+}
+
+// singboxVersion 取 `sing-box version` 的版本号，供注册上报（契约 §4.1）。
+func (a *Agent) singboxVersion() string {
+	out, err := exec.Command(a.cfg.SingboxBin, "version").Output()
+	if err != nil {
+		return "unknown"
+	}
+	// 首行形如：sing-box version 1.10.7
+	line := strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0]
+	if fields := strings.Fields(line); len(fields) >= 3 {
+		return fields[2]
+	}
+	return "unknown"
 }
