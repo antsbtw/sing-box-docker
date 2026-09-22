@@ -20,6 +20,13 @@ import (
 	"otun-node-agent/internal/stats"
 )
 
+// Version 由构建时注入：go build -ldflags "-X main.Version=v1.11.0"
+//
+// ⚠️ 不要改名或移动：CI(.github/workflows/release.yml)按此路径注入，
+// 注册请求的 agent_version 用它，后端据此做 agent_too_old 判定
+// （接线契约 §4.1）。未注入时为 dev，后端会拒绝注册。
+var Version = "dev"
+
 // Agent 是主控制器
 type Agent struct {
 	cfg        *config.AgentConfig

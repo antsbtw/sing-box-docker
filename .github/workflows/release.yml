@@ -1,0 +1,135 @@
+name: Release
+
+# 一次发版产出全部五件资产，装在同一个 tag 下：
+#   install.sh
+#   agent-linux-{amd64,arm64}
+#   sing-box-linux-{amd64,arm64}
+#   SHA256SUMS
+#
+# ⚠️ 为什么要放在同一个 release：
+# 此前 agent 走浮动 latest、sing-box 钉版本，两者可能来自不同时间的构建。
+# 2026-08-31 的事故就是这么来的。现在 install.sh 只认自己所在的 tag，
+# 三件二进制必然同源。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的版本号（如 v1.11.0）'
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # sing-box 上游版本。
+  # ⚠️ 升级跨过 1.11.x 时必须去掉 with_reality_server —— 该标签自 1.12.0
+  # 起并入 with_utls，继续带着会编译失败。
+  SINGBOX_VERSION: '1.10.7'
+  SINGBOX_TAGS: 'with_v2ray_api,with_utls,with_reality_server'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      # ⚠️ 必须注入版本号：注册体的 agent_version 要用它，
+      # 后端据此做 agent_too_old 判定（契约 §4.1）。
+      - name: Build agent
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -ldflags "-s -w -X main.Version=${TAG}" \
+            -o agent-linux-${{ matrix.goarch }} ./cmd/agent
+
+      # sing-box 用官方源码编译，仅加官方支持的构建标签，不改一行代码。
+      # 用户可据此自行复现并比对校验和。
+      - name: Build sing-box from upstream source
+        run: |
+          git clone --depth 1 --branch "v${SINGBOX_VERSION}" \
+            https://github.com/SagerNet/sing-box.git /tmp/sing-box
+          cd /tmp/sing-box
+          # ⚠️ 必须注入版本号：不打则 `sing-box version` 输出 unknown，
+          # 注册体的 singbox_version 就报不出来（2026-08-31 教训）。
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.goarch }} \
+            go build -tags "${SINGBOX_TAGS}" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${SINGBOX_VERSION}" \
+            -o "$GITHUB_WORKSPACE/sing-box-linux-${{ matrix.goarch }}" ./cmd/sing-box
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.goarch }}
+          path: |
+            agent-linux-${{ matrix.goarch }}
+            sing-box-linux-${{ matrix.goarch }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect assets and generate SHA256SUMS
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          # 把实际 tag 烙进 install.sh —— 脚本据此只从自己所在的 release
+          # 取二进制，三件产物必然同源。
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          sed "s/__RELEASE_TAG__/${TAG}/" install.sh > release/install.sh
+          grep -q "__RELEASE_TAG__" release/install.sh && { echo "tag 替换失败"; exit 1; }
+          chmod +x release/install.sh
+          cd release
+          chmod +x agent-linux-* sing-box-linux-*
+          # 校验和覆盖全部资产，install.sh 自身也在内 ——
+          # 后端把它的哈希随 install_command 下发给 App 展示。
+          sha256sum * > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: release/*
+          fail_on_unmatched_files: true
+          body: |
+            ## 资产
+
+            | 文件 | 说明 |
+            |---|---|
+            | `install.sh` | 安装脚本，内部钉本 release 的二进制 |
+            | `agent-linux-{amd64,arm64}` | OTun Node Agent |
+            | `sing-box-linux-{amd64,arm64}` | sing-box **v${{ env.SINGBOX_VERSION }} 官方源码**，构建标签 `${{ env.SINGBOX_TAGS }}`，未修改源码 |
+            | `SHA256SUMS` | 全部资产的校验和 |
+
+            ## 校验
+
+            ```bash
+            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/SHA256SUMS
+            sha256sum -c SHA256SUMS
+            ```
+
+            ## 安装
+
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ github.event.inputs.tag || github.ref_name }}/install.sh -o install.sh
+            sudo bash install.sh --enroll-token <token> --api-url <url>
+            ```
