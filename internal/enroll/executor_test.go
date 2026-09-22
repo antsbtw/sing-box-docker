@@ -154,3 +154,99 @@ func TestPingAndGetConfig(t *testing.T) {
 		t.Errorf("agent_version 应回报注入的版本，得到 %v", ack.Data["agent_version"])
 	}
 }
+
+// M-1：expire_at 三态。最危险的是"已过去的时刻"——
+// 换算成天数会得到负数、夹成 0，而 0 在 Store 里是"永不过期"，
+// 于是"立即到期"变成"永久有效"。
+func TestUpdateUserExpireAtSemantics(t *testing.T) {
+	const uid = "0d3f1b2c-5555-4aaa-8bbb-000000000005"
+
+	setup := func(t *testing.T) *Executor {
+		e := newExec(t)
+		e.Execute(cmd("c", CmdCreateUser, map[string]any{
+			"uuid": uid, "name": "eve", "ss_password": "pw-eve-000000001",
+		}), time.Now())
+		return e
+	}
+
+	t.Run("过去的时间必须真的过期", func(t *testing.T) {
+		e := setup(t)
+		past := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339)
+		ack := e.Execute(cmd("u", CmdUpdateUser, map[string]any{
+			"uuid": uid, "expire_at": past,
+		}), time.Now())
+		if ack.Result != ResultDone {
+			t.Fatalf("应 done，得到 %s/%s", ack.Result, ack.Detail)
+		}
+		u, _ := e.store.GetUser(uid)
+		if u.ExpireAt == nil {
+			t.Fatal("过去的 expire_at 被当成了「永不过期」—— 这正是 M-1 的 bug")
+		}
+		if !u.ExpireAt.Before(time.Now()) {
+			t.Errorf("到期时间应在过去，得到 %v", u.ExpireAt)
+		}
+	})
+
+	t.Run("显式 null 表示永不过期", func(t *testing.T) {
+		e := setup(t)
+		future := time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)
+		e.Execute(cmd("u1", CmdUpdateUser, map[string]any{
+			"uuid": uid, "expire_at": future,
+		}), time.Now())
+
+		e.Execute(cmd("u2", CmdUpdateUser, map[string]any{
+			"uuid": uid, "expire_at": nil,
+		}), time.Now())
+
+		u, _ := e.store.GetUser(uid)
+		if u.ExpireAt != nil {
+			t.Errorf("expire_at=null 应清除到期时间，得到 %v", u.ExpireAt)
+		}
+	})
+
+	t.Run("字段缺席不改动", func(t *testing.T) {
+		e := setup(t)
+		future := time.Now().Add(72 * time.Hour)
+		e.Execute(cmd("u1", CmdUpdateUser, map[string]any{
+			"uuid": uid, "expire_at": future.UTC().Format(time.RFC3339),
+		}), time.Now())
+
+		e.Execute(cmd("u2", CmdUpdateUser, map[string]any{
+			"uuid": uid, "name": "eve2",
+		}), time.Now())
+
+		u, _ := e.store.GetUser(uid)
+		if u.ExpireAt == nil {
+			t.Fatal("未给 expire_at 时不应清除原有到期时间")
+		}
+		if d := u.ExpireAt.Sub(future); d > time.Minute || d < -time.Minute {
+			t.Errorf("到期时间被改动了：%v vs %v", u.ExpireAt, future)
+		}
+	})
+}
+
+// M-2：同 uuid 同密码的重复投递应应用其余字段（真 upsert），
+// 而不是只比 name 就回 done 把变更丢掉。
+func TestCreateUserAppliesFieldsOnRepeat(t *testing.T) {
+	e := newExec(t)
+	const uid = "0d3f1b2c-6666-4aaa-8bbb-000000000006"
+
+	e.Execute(cmd("c1", CmdCreateUser, map[string]any{
+		"uuid": uid, "name": "frank", "ss_password": "pw-frank-0000001",
+		"traffic_limit": float64(1000),
+	}), time.Now())
+
+	// 后端修正后重发：同 uuid 同密码，但限额变了
+	ack := e.Execute(cmd("c2", CmdCreateUser, map[string]any{
+		"uuid": uid, "name": "frank", "ss_password": "pw-frank-0000001",
+		"traffic_limit": float64(9999),
+	}), time.Now())
+
+	if ack.Result != ResultDone {
+		t.Fatalf("应 done，得到 %s/%s", ack.Result, ack.Error)
+	}
+	u, _ := e.store.GetUser(uid)
+	if u.TrafficLimit != 9999 {
+		t.Errorf("重复投递应应用新的 traffic_limit，得到 %d", u.TrafficLimit)
+	}
+}

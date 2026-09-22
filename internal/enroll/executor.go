@@ -163,14 +163,20 @@ func (e *Executor) updateUser(cmd Command) CommandAck {
 		TrafficLimit: p.TrafficLimit,
 		Protocols:    p.Protocols,
 	}
-	// 契约用绝对时间 expire_at，而 Store 收的是相对天数，此处换算。
-	// null 表示永不过期 → 0 天。
-	if p.ExpireAt != nil {
-		days := int(time.Until(*p.ExpireAt).Hours() / 24)
-		if days < 0 {
-			days = 0
+
+	// expire_at 三态（契约 §6.2）：
+	//   字段缺席     → 不改
+	//   显式 null    → 永不过期
+	//   具体时间     → 直存绝对时间
+	//
+	// ⚠️ 不能换算成天数：已过去的时刻会算出负数、被夹成 0，
+	// 而 0 在 Store 里是"永不过期" —— "立即到期"就变成了"永久有效"。
+	if raw, present := cmd.Payload["expire_at"]; present {
+		if raw == nil {
+			req.ClearExpire = true
+		} else if p.ExpireAt != nil {
+			req.ExpireAt = p.ExpireAt
 		}
-		req.ExpireDays = &days
 	}
 
 	if _, err := e.store.UpdateUser(p.UUID, req); err != nil {

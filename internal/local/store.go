@@ -181,10 +181,32 @@ func (s *Store) UpsertUser(u *LocalUser) (*LocalUser, bool, error) {
 	}
 
 	if existing, ok := s.users[u.UUID]; ok {
-		if existing.SSPassword != u.SSPassword || existing.Name != u.Name {
+		// ss_password 是身份的一部分：不同密码意味着后端认为这是另一个用户，
+		// 不能静默覆盖（契约 §6.4）。
+		if existing.SSPassword != u.SSPassword {
 			return nil, false, ErrUserConflict
 		}
-		return existing, false, nil // 重复投递，已是目标状态
+
+		// 同 uuid 同密码 = 重复投递或后端修正后重发。
+		// ⚠️ 此前只比 name 就回 done，protocols / traffic_limit / expire_at /
+		// enabled 的变更会被静默丢弃 —— 后端以为生效了，实际沿用旧值。
+		// 改为真正 upsert：应用其余字段再回成功。
+		existing.Name = u.Name
+		if len(u.Protocols) > 0 {
+			existing.Protocols = u.Protocols
+		}
+		existing.Enabled = u.Enabled
+		existing.TrafficLimit = u.TrafficLimit
+		existing.ExpireAt = u.ExpireAt
+		existing.UpdatedAt = time.Now()
+
+		if err := s.save(); err != nil {
+			return nil, false, fmt.Errorf("save users: %w", err)
+		}
+		if s.onChange != nil {
+			go s.onChange()
+		}
+		return existing, false, nil
 	}
 
 	protocols := u.Protocols
@@ -281,7 +303,16 @@ func (s *Store) UpdateUser(uuid string, req *UpdateUserRequest) (*LocalUser, err
 	if req.TrafficLimit != nil {
 		user.TrafficLimit = *req.TrafficLimit
 	}
-	if req.ExpireDays != nil {
+	switch {
+	case req.ClearExpire:
+		// 显式 null：永不过期
+		user.ExpireAt = nil
+	case req.ExpireAt != nil:
+		// 绝对时间直存，不经天数换算 —— 过去的时刻就是已过期，
+		// 不会被当成"永不过期"
+		t := *req.ExpireAt
+		user.ExpireAt = &t
+	case req.ExpireDays != nil:
 		if *req.ExpireDays > 0 {
 			t := time.Now().AddDate(0, 0, *req.ExpireDays)
 			user.ExpireAt = &t
@@ -342,6 +373,26 @@ func (s *Store) UpdateTraffic(uuid string, upload, download int64) {
 	}
 }
 
+// Clear 清空全部本地用户并落盘。
+//
+// 用于节点被后端解绑后的终态清理（接线契约 §5.3）。
+// ⚠️ 不清的话：unit 仍是 enabled，机器重启后 agent 起来、没有 node.json、
+// 也没有 token，就以普通 local 模式把老用户全部重新拉起 ——
+// 一个已在 App 里删除的节点继续给人当出口。
+func (s *Store) Clear() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.users = make(map[string]*LocalUser)
+	if err := s.save(); err != nil {
+		return fmt.Errorf("save users: %w", err)
+	}
+	if s.onChange != nil {
+		go s.onChange()
+	}
+	return nil
+}
+
 // GetUserCount 获取用户数量
 func (s *Store) GetUserCount() int {
 	s.mu.RLock()
@@ -364,6 +415,18 @@ type UpdateUserRequest struct {
 	TrafficLimit *int64   `json:"traffic_limit,omitempty"`
 	ExpireDays   *int     `json:"expire_days,omitempty"`
 	Protocols    []string `json:"protocols,omitempty"`
+
+	// ExpireAt 直接给绝对到期时间，用于接线契约 §6.2 的 expire_at。
+	//
+	// ⚠️ 不能用 ExpireDays 承载绝对时间：它把"已过去的时刻"算成 0 天，
+	// 而 0 在下面的逻辑里是"永不过期" —— 于是"立即到期"变成"永久有效"。
+	// 另外天数截断最多丢 23h59m。
+	// ExpireAt 与 ExpireDays 同时给出时以 ExpireAt 为准。
+	ExpireAt *time.Time `json:"expire_at,omitempty"`
+
+	// ClearExpire 显式清除到期时间（契约里的 expire_at: null = 永不过期）。
+	// 单靠 ExpireAt == nil 分不清"没给这个字段"和"给了 null"。
+	ClearExpire bool `json:"-"`
 }
 
 // generatePassword 生成随机密码

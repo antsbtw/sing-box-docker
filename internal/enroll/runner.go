@@ -111,20 +111,45 @@ func (r *Runner) register(ctx context.Context) error {
 
 	log.Printf("[enroll] 开始注册，machine_id=%s…", mid[:12])
 
-	resp, err := r.Client.Register(ctx, req)
-	if err != nil {
+	// 网络错误 / 5xx / 429 必须退避重试（契约 §0）：装机时 DNS 未就绪、
+	// 后端正在发版、撞限流都是瞬时故障，只试一次会把它们变成永久失败 ——
+	// agent 进程还活着，systemd 不会重启它，unit 里的 token 也再没人读。
+	//
+	// 循环有界：token 15 分钟后自然变成 token_expired（终态），随即退出。
+	var resp *RegisterResponse
+	for attempt := 0; ; attempt++ {
+		var err error
+		resp, err = r.Client.Register(ctx, req)
+		if err == nil {
+			break
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
 		var apiErr *APIError
 		if errors.As(err, &apiErr) && apiErr.IsFatalRegister() {
-			// 重试也是同样结果（token 已废）。退出让 install.sh 的 60 秒
-			// 等待失败，把真实原因呈现给用户，而不是反复重启刷日志（契约 §2.4-5）。
+			// 终态：重试也是同样结果。退出让 install.sh 的 60 秒等待失败，
+			// 把真实原因呈现给用户（契约 §2.4-5、§4.3）。
 			log.Printf("[enroll] 注册被拒绝：%s", apiErr.Error())
 			if apiErr.Code == ErrAgentTooOld {
 				log.Printf("[enroll] 需要 agent %s 及以上，当前 %s",
 					apiErr.MinVersion, r.AgentVersion)
 			}
-			return fmt.Errorf("注册失败（不可重试）：%w", err)
+			return fmt.Errorf("%w: %v", ErrEnrollFatal, err)
 		}
-		return fmt.Errorf("注册失败：%w", err)
+
+		d := Backoff(attempt)
+		// 429 带 retry_after_s 时听服务端的（S-4）
+		if errors.As(err, &apiErr) && apiErr.RetryAfterS > 0 {
+			if ra := time.Duration(apiErr.RetryAfterS) * time.Second; ra > d {
+				d = ra
+			}
+		}
+		log.Printf("[enroll] 注册失败（%v），%v 后重试", err, d.Truncate(time.Millisecond))
+		if !sleepCtx(ctx, d) {
+			return ctx.Err()
+		}
 	}
 
 	nf := &NodeFile{
@@ -166,6 +191,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			return nil
 		}
 
+		roundStart := time.Now()
 		resp, err := r.pollOnce(ctx, wait)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -200,23 +226,54 @@ func (r *Runner) Run(ctx context.Context) error {
 		attempt = 0
 		r.dropAcked(resp.Acked)
 
+		newAcks := 0
 		for _, cmd := range resp.Commands {
 			ack := r.Executor.Execute(cmd, resp.ServerTime)
 			r.pendingAcks = append(r.pendingAcks, ack)
+			newAcks++
 			log.Printf("[enroll] 指令 %s(%s) → %s", cmd.Type, shortID(cmd.CommandID), ack.Result)
 		}
 
-		// 有回执要送时不必挂满 25 秒，立即再来一轮（契约 §5.1 的 wait=0 用法）
-		if len(r.pendingAcks) > 0 {
+		// 刚产生回执时立即再轮一次把它送出去，不必挂满 25 秒。
+		//
+		// ⚠️ 只对**紧接着的那一次**生效：若判据写成"pendingAcks 非空就 wait=0"，
+		// 后端一旦不把某个 id 放进 acked（后端 bug、契约版本错配），
+		// agent 就会以 HTTP 请求的速度无限空转打后端。
+		// 回执仍会在后续轮次继续携带，不会丢（契约 §5.2）。
+		if newAcks > 0 {
 			wait = 0
 		} else {
 			wait = clampWait(resp.NextWaitS)
 		}
+
+		// 兜底限速。
+		//
+		// 正常情况下服务端会挂满 wait 秒，这个 sleep 不会触发。
+		// 但 agent 不能把限速完全托付给服务端：若后端提前返回
+		// （挂起实现有 bug、走了缓存、或中间有代理不支持长连接），
+		// 循环就会以 HTTP 请求的速度空转 —— 实测能到每秒两万次。
+		// 这里保证两次轮询之间至少隔 minPollGap。
+		if elapsed := time.Since(roundStart); elapsed < minPollGap {
+			if !sleepCtx(ctx, minPollGap-elapsed) {
+				return nil
+			}
+		}
 	}
 }
 
+// minPollGap 是两次轮询之间的最小间隔，防止服务端提前返回时空转。
+// 取 1 秒：远小于正常的 25 秒挂起，不影响指令延迟。
+const minPollGap = time.Second
+
 // ErrRevoked 表示后端已吊销本节点。
 var ErrRevoked = errors.New("node revoked")
+
+// ErrEnrollFatal 表示注册遇到终态错误（token 已废、版本过低等）。
+//
+// 调用方应以 ExitRevoked 退出：token 不会自己变好，重试只会每 5 秒
+// 重打同一个废 token，12 次后撞注册口的 30 次/小时 IP 限流；
+// 而 install.sh 退出后这个循环还会一直跑下去。
+var ErrEnrollFatal = errors.New("enrollment rejected")
 
 func (r *Runner) pollOnce(ctx context.Context, wait int) (*PollResponse, error) {
 	req := &PollRequest{

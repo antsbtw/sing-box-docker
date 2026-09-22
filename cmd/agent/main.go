@@ -785,6 +785,13 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 	}
 
 	if err := runner.Prepare(ctx); err != nil {
+		// 注册终态（token 已废、版本过低）：不能让进程继续以普通 local 模式
+		// 活着 —— systemctl status 会显示 active，看着正常实则没接入。
+		// 以退出码 3 结束，配合 RestartPreventExitStatus=3 不再拉起（契约 §4.3）。
+		if errors.Is(err, enroll.ErrEnrollFatal) {
+			log.Printf("[enroll] 注册被拒绝，agent 退出且不再重启：%v", err)
+			os.Exit(enroll.ExitRevoked)
+		}
 		return err
 	}
 	a.enrollRunner = runner
@@ -792,8 +799,16 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 	go func() {
 		err := runner.Run(ctx)
 		if errors.Is(err, enroll.ErrRevoked) {
-			// 终态：停数据面、清本地凭据，标记让 main 以退出码 3 结束
-			log.Println("[enroll] 收到解绑指令，停止 sing-box")
+			// 终态：清用户 → 停数据面 → 清凭据（契约 §5.3）
+			//
+			// 先清用户再停服务：不清的话机器重启后 agent 会以普通 local 模式
+			// 把老用户全部重新拉起，一个已删除的节点继续给人当出口。
+			log.Println("[enroll] 收到解绑指令，清除本地用户并停止 sing-box")
+			if a.localStore != nil {
+				if err := a.localStore.Clear(); err != nil {
+					log.Printf("[enroll] 清除本地用户失败：%v", err)
+				}
+			}
 			_ = a.manager.Stop()
 			runner.Cleanup()
 			a.mu.Lock()

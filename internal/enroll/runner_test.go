@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,7 +173,9 @@ func TestAckRetriedUntilAcknowledged(t *testing.T) {
 	r := newRunner(t, srv)
 	r.node = &NodeFile{NodeID: "n", NodeSecret: "s", PollURL: srv.URL + "/poll"}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	// 轮询之间有 minPollGap（1s）兜底限速，要覆盖"第 2 轮送出、
+	// 第 2 轮不确认、第 3 轮再送"这个序列，窗口需留足 3 轮以上。
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
 	_ = r.Run(ctx)
 
@@ -193,5 +196,89 @@ func TestClampWait(t *testing.T) {
 		if got := clampWait(tc.in); got != tc.want {
 			t.Errorf("clampWait(%d)=%d，期望 %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+// H-5：瞬时故障（5xx / 网络 / 429）必须退避重试，不能一次失败就永久放弃。
+// 装机时 DNS 未就绪、后端正在发版都属此类。
+func TestRegisterRetriesTransient(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&calls, 1)
+		if n < 3 {
+			w.WriteHeader(503)
+			_ = json.NewEncoder(w).Encode(APIError{Code: ErrServerInternal, Message: "发版中"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
+			NodeID: "byo-retry", NodeSecret: "nsk1_ok", PollURL: "http://x/poll",
+		})
+	}))
+	defer srv.Close()
+
+	r := newRunner(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	if err := r.Prepare(ctx); err != nil {
+		t.Fatalf("瞬时故障后应最终成功，得到 %v", err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Errorf("应重试到第 3 次成功，实际请求 %d 次", got)
+	}
+	if nf, _ := LoadNodeFile(r.DataDir); nf == nil || nf.NodeID != "byo-retry" {
+		t.Error("重试成功后应写入 node.json")
+	}
+}
+
+// H-5：终态错误要能被 main 识别为 ErrEnrollFatal，据此以退出码 3 结束 ——
+// 不能让进程继续以普通 local 模式活着，那是"看着正常其实没接入"。
+func TestRegisterFatalIsTagged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(409)
+		_ = json.NewEncoder(w).Encode(APIError{
+			Code: ErrAgentTooOld, Message: "版本过低", MinVersion: "v1.12.0",
+		})
+	}))
+	defer srv.Close()
+
+	r := newRunner(t, srv)
+	err := r.Prepare(context.Background())
+	if !errors.Is(err, ErrEnrollFatal) {
+		t.Fatalf("终态错误应包装为 ErrEnrollFatal，得到 %v", err)
+	}
+}
+
+// M-3：后端一直不确认回执时，不能变成以 HTTP 速度空转的热循环。
+func TestNoHotLoopWhenAcksNeverAcknowledged(t *testing.T) {
+	var polls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&polls, 1)
+		resp := PollResponse{ServerTime: time.Now(), NextWaitS: 25}
+		if n == 1 {
+			resp.Commands = []Command{{
+				CommandID: "cmd-x", Type: CmdPing,
+				ExpiresAt: time.Now().Add(time.Minute),
+			}}
+		}
+		// 永远不回 acked
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	r := newRunner(t, srv)
+	r.node = &NodeFile{NodeID: "n", NodeSecret: "s", PollURL: srv.URL + "/poll"}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+	_ = r.Run(ctx)
+
+	// 第 1 轮领指令、第 2 轮 wait=0 送回执，此后应回到正常 wait，
+	// 1.5 秒内不该打出几十次请求
+	if n := atomic.LoadInt32(&polls); n > 5 {
+		t.Errorf("回执未被确认时出现热循环：1.5 秒内轮询了 %d 次", n)
+	}
+	if len(r.pendingAcks) == 0 {
+		t.Error("未被确认的回执应继续保留在队列中")
 	}
 }
