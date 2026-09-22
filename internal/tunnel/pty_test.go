@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"errors"
 	"io"
 	"os"
 	"strings"
@@ -159,5 +160,139 @@ func TestShellEnvDropsSecrets(t *testing.T) {
 		if strings.Contains(kv, "super-secret-key") || strings.Contains(kv, "enroll-token-value") {
 			t.Errorf("凭据泄漏到终端环境：%s", kv)
 		}
+	}
+}
+
+// T-1：shell 退出后必须回 exit-status 并关闭 channel，
+// 否则 App 的终端页面会一直挂着，用户看不到「会话已结束」。
+func TestShellExitClosesSession(t *testing.T) {
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exit1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	if err := sess.RequestPty("xterm", 24, 80, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+	stdin, _ := sess.StdinPipe()
+	if err := sess.Shell(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdin.Write([]byte("exit 7\n"))
+
+	// Wait 必须在 shell 结束后很快返回，并带回退出码
+	waitErr := make(chan error, 1)
+	go func() { waitErr <- sess.Wait() }()
+
+	select {
+	case err := <-waitErr:
+		var ee *ssh.ExitError
+		if err == nil {
+			t.Fatal("期望拿到退出码 7，实际正常返回")
+		}
+		if !errors.As(err, &ee) {
+			t.Fatalf("期望 ExitError，实际 %T: %v", err, err)
+		}
+		if ee.ExitStatus() != 7 {
+			t.Errorf("退出码 = %d，应为 7", ee.ExitStatus())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("shell 退出后 10s 内没收到 exit-status/channel 关闭 —— App 终端会挂住")
+	}
+}
+
+// T-2：pty-req 之后的 exec 要跑在 pty 上（ssh -t host cmd 形态）。
+// top、apt 进度条这类命令经 exec 启动时需要（A-4/A-5）。
+func TestExecOnPTY(t *testing.T) {
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exec1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	if err := sess.RequestPty("xterm-256color", 40, 120, ssh.TerminalModes{}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := sess.Output("tty >/dev/null && echo IS_TTY; stty size; echo T=$TERM")
+	if err != nil {
+		t.Fatalf("exec 失败：%v（输出 %q）", err, string(out))
+	}
+	got := string(out)
+	t.Logf("输出:\n%s", got)
+
+	if !strings.Contains(got, "IS_TTY") {
+		t.Error("exec 没有跑在 pty 上（tty 报 not a tty）")
+	}
+	if !strings.Contains(got, "40 120") {
+		t.Error("exec 的 pty 窗口尺寸不对，应为 40 120")
+	}
+	if !strings.Contains(got, "T=xterm-256color") {
+		t.Error("exec 的 TERM 未生效")
+	}
+}
+
+// 没有 pty-req 的 exec 保持原样：不分配 pty（安装脚本走这条）。
+func TestExecWithoutPTYStaysNonInteractive(t *testing.T) {
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exec2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	out, err := sess.Output("tty >/dev/null && echo IS_TTY || echo NO_TTY")
+	if err != nil {
+		t.Fatalf("exec 失败：%v", err)
+	}
+	if !strings.Contains(string(out), "NO_TTY") {
+		t.Errorf("无 pty-req 的 exec 不应分配 pty，输出：%q", string(out))
+	}
+}
+
+// exec 的退出码要回传（安装脚本据此判断成败）。
+func TestExecExitStatus(t *testing.T) {
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exec3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	err = sess.Run("exit 7")
+	var ee *ssh.ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("期望 ExitError，实际 %T: %v", err, err)
+	}
+	if ee.ExitStatus() != 7 {
+		t.Errorf("退出码 = %d，应为 7", ee.ExitStatus())
 	}
 }

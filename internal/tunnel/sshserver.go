@@ -207,12 +207,14 @@ func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 			_ = req.Reply(true, nil)
 			go func() {
 				defer close(piped)
-				s.pipe(ch, f, c)
-				// ptyFile 的所有权收回锁内：置空后 window-change 不会再 ioctl 已关闭的 fd
-				mu.Lock()
-				ptyFile = nil
-				mu.Unlock()
-				_ = f.Close()
+				// 置空与关闭在同一把锁内完成，
+				// window-change 不会再 ioctl 到已关闭的 fd
+				s.pipe(ch, f, c, func() {
+					mu.Lock()
+					ptyFile = nil
+					mu.Unlock()
+					_ = f.Close()
+				})
 			}()
 
 		case "exec":
@@ -227,7 +229,7 @@ func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
 				return
 			}
 			_ = req.Reply(true, nil)
-			s.runExec(ch, command)
+			s.runExec(ch, command, ptyReq)
 			return
 
 		case "env":
@@ -355,51 +357,117 @@ func isSensitiveEnv(kv string) bool {
 	return false
 }
 
-// runExec 执行一条非交互命令（A-5，安装脚本用）。
-func (s *Server) runExec(ch ssh.Channel, command string) {
+// runExec 执行一条命令（A-5，安装脚本用）。
+//
+// 若客户端先发了 pty-req（即 `ssh -t host cmd` 形态），命令要跑在 pty 上：
+// top、apt 进度条这类程序靠 isatty 决定是否输出交互界面（A-4/A-5）。
+// 没有 pty-req 时保持非交互，安装脚本走的是这条。
+func (s *Server) runExec(ch ssh.Channel, command string, p *ptyRequest) {
 	cmd := exec.Command("/bin/sh", "-c", command)
-	cmd.Stdin = ch
-	cmd.Stdout = ch
-	cmd.Stderr = ch.Stderr()
+	cmd.Env = shellEnv(termOrDefault(p))
+	cmd.Dir = homeDir()
 
-	err := cmd.Run()
-	code := 0
-	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			code = ee.ExitCode()
-		} else {
-			code = 1
+	if p == nil {
+		cmd.Stdin = ch
+		cmd.Stdout = ch
+		cmd.Stderr = ch.Stderr()
+
+		code := 0
+		if err := cmd.Run(); err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				code = ee.ExitCode()
+			} else {
+				code = 1
+			}
 		}
+		sendExitStatus(ch, code)
+		_ = ch.CloseWrite()
+		_ = ch.Close()
+		return
 	}
-	sendExitStatus(ch, code)
+
+	f, err := pty.Start(cmd)
+	if err != nil {
+		log.Printf("[tunnel] exec 分配 pty 失败：%v", err)
+		sendExitStatus(ch, 1)
+		_ = ch.Close()
+		return
+	}
+	setWinsize(f, p.cols, p.rows)
+
+	// 复用 pipe 的收尾：等进程退出 → 关 pty master → 回退出码 → 关 channel。
+	// exec 的 pty 不与请求循环共享，直接关即可。
+	s.pipe(ch, f, cmd, func() { _ = f.Close() })
 }
 
 // pipe 在 SSH channel 与 PTY 之间双向搬运，直到任一端结束。
-func (s *Server) pipe(ch ssh.Channel, ptyFile *os.File, cmd *exec.Cmd) {
+// pipe 搬运字节并负责会话收尾。
+//
+// closePTY 由调用方提供：pty master 的关闭必须和 window-change 的 ioctl
+// 互斥，所以这个动作交回持有锁的一方做，pipe 只决定「什么时候关」。
+func (s *Server) pipe(ch ssh.Channel, ptyFile *os.File, cmd *exec.Cmd, closePTY func()) {
 	var once sync.Once
 	done := make(chan struct{})
 	stop := func() { once.Do(func() { close(done) }) }
 
+	// 进程退出是会话结束的权威信号。
+	//
+	// 不能只等 io.Copy：shell 退出后 pty master 未必立刻报 EOF，
+	// 两个 Copy 都可能继续阻塞，于是 exit-status 发不出去、channel 不关，
+	// App 的终端页面一直挂着（联调 T-1）。
+	waited := make(chan int, 1)
 	go func() {
-		_, _ = io.Copy(ptyFile, ch) // 用户输入 → shell
+		code := 0
+		if err := cmd.Wait(); err != nil {
+			var ee *exec.ExitError
+			if errors.As(err, &ee) {
+				code = ee.ExitCode()
+			} else {
+				code = 1
+			}
+		}
+		waited <- code
 		stop()
 	}()
+
+	// 用户输入 → shell。
+	// stdin 到头不代表会话结束 —— exec 形态下客户端根本不发输入，
+	// 交互 shell 也可能只半关闭。所以这里不调 stop()。
 	go func() {
-		_, _ = io.Copy(ch, ptyFile) // shell 输出 → 用户
+		_, _ = io.Copy(ptyFile, ch)
+	}()
+	// shell 输出 → 用户。这一侧断了说明 pty 已关或对端走了。
+	go func() {
+		_, _ = io.Copy(ch, ptyFile)
 		stop()
 	}()
 
 	<-done
 
-	code := 0
-	if err := cmd.Wait(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			code = ee.ExitCode()
+	// 关掉 pty master，解开仍卡在 Copy 上的那一侧，
+	// 顺便让 shell 收到 SIGHUP（客户端先断开时）。
+	closePTY()
+
+	// 进程还没退（客户端主动断开）就等一下，拿到真实退出码。
+	var code int
+	select {
+	case code = <-waited:
+	case <-time.After(2 * time.Second):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case code = <-waited:
+		case <-time.After(2 * time.Second):
+			code = 1
 		}
 	}
+
+	// 先回退出码，再关 channel —— x/crypto/ssh 的标准收尾顺序。
 	sendExitStatus(ch, code)
+	_ = ch.CloseWrite()
+	_ = ch.Close()
 }
 
 func sendExitStatus(ch ssh.Channel, code int) {

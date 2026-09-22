@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
@@ -48,5 +49,27 @@ func TestRevokeWithoutShutdownHandle(t *testing.T) {
 	a.handleRevoked(nil)
 	if !a.Revoked() {
 		t.Fatal("Revoked() 应为 true")
+	}
+}
+
+// T-3：token 模式下管理面只绑回环，不暴露在公网。
+func TestTokenModeBindsLoopback(t *testing.T) {
+	dir := t.TempDir()
+	cwd, _ := os.Getwd()
+	defer os.Chdir(cwd)
+	os.Chdir(dir)
+	os.MkdirAll("./data", 0o755)
+
+	// 无 token、无 node.json → 存量 API-Key 模式
+	t.Setenv("OTUN_ENROLL_TOKEN", "")
+	os.Unsetenv("OTUN_ENROLL_TOKEN")
+	if isTokenMode() {
+		t.Error("既无 token 也未接入时，不应判为 token 模式（存量节点要保持外部可达）")
+	}
+
+	// 有 token → token 模式
+	t.Setenv("OTUN_ENROLL_TOKEN", "obx1_test")
+	if !isTokenMode() {
+		t.Error("配了 OTUN_ENROLL_TOKEN 应判为 token 模式")
 	}
 }

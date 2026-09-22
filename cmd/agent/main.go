@@ -262,6 +262,18 @@ func (a *Agent) Run(ctx context.Context) {
 	a.runMainLoop(ctx)
 }
 
+// isTokenMode 报告本机是否走 Token 接入（外连模式）。
+//
+// 口径与 startEnrollment 一致：配了 token，或已经接入过（有 node.json）。
+// 两处必须一致 —— 否则会出现「按 token 模式绑回环，却没起长轮询」这类错配。
+func isTokenMode() bool {
+	if os.Getenv("OTUN_ENROLL_TOKEN") != "" {
+		return true
+	}
+	existing, _ := enroll.LoadNodeFile("./data")
+	return existing != nil
+}
+
 // startHTTPServer 启动 HTTP 服务
 func (a *Agent) startHTTPServer() {
 	mux := http.NewServeMux()
@@ -283,10 +295,20 @@ func (a *Agent) startHTTPServer() {
 		log.Println("Local API routes registered")
 	}
 
+	// token 模式下把管理面收回回环。
+	//
+	// App 经反向隧道进来，不再直连 8080；绑在所有网卡上只是把
+	// node_api_key 保护的管理面白白暴露在公网（联调 T-3）。
+	// 存量 API-Key 模式仍需外部可达，保持原样。
+	addr := ":8080"
+	if isTokenMode() {
+		addr = "127.0.0.1:8080"
+	}
+
 	go func() {
-		log.Println("HTTP server starting on :8080")
+		log.Printf("HTTP server starting on %s", addr)
 		server := &http.Server{
-			Addr:         ":8080",
+			Addr:         addr,
 			Handler:      mux,
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: 30 * time.Second,
