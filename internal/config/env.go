@@ -27,6 +27,11 @@ func LoadFromEnv() *AgentConfig {
 		LogLevel:       getEnv("LOG_LEVEL", "info"),
 		ManagementMode: mode,
 		ServerIP:       getEnv("SERVER_IP", ""), // 服务器公网 IP，用于生成连接 URL
+		// Reality 握手借用的真实站点域名。
+		// ⚠️ 这是 local 模式下 SNI 的**唯一来源**：配置生成、分享链接、
+		// 注册上报都取它（接线契约 §8）。此前 generator 与 local API 各写死
+		// 一份 "www.microsoft.com"，改其一就会两边不一致、客户端连不上。
+		RealitySNI: getEnv("REALITY_SNI", "www.microsoft.com"),
 	}
 }
 
