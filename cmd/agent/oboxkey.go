@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -56,6 +58,22 @@ func oboxKeyArgs() []string {
 		return os.Args[1:]
 	}
 	return os.Args[2:]
+}
+
+// reportError 打印错误，并在权限不足时告诉用户怎么办。
+//
+// authorized_keys.json 是 0600 —— 它决定谁能进这台机器，
+// 不该让普通用户读到。但 permission denied 这五个字对用户毫无帮助：
+// 他不知道是自己权限不够，还是文件坏了、装漏了。
+func reportError(action string, err error) int {
+	fmt.Fprintf(os.Stderr, "%s：%v\n", action, err)
+	if errors.Is(err, fs.ErrPermission) {
+		fmt.Fprintf(os.Stderr,
+			"\n这个列表只有 root 能看 —— 它决定谁能进这台机器。\n"+
+				"请加 sudo 重试：\n  sudo obox-key %s\n",
+			strings.Join(oboxKeyArgs(), " "))
+	}
+	return 1
 }
 
 // runOboxKey 处理 obox-key 子命令。返回退出码。
@@ -119,8 +137,7 @@ func oboxKeyDataDir() string {
 func oboxKeyList(store *tunnel.AuthKeyStore) int {
 	keys, err := store.List()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "读取失败：%v\n", err)
-		return 1
+		return reportError("读取失败", err)
 	}
 	if len(keys) == 0 {
 		fmt.Println("还没有授权任何设备 —— 当前谁都无法从 App 打开这台机器的终端。")
@@ -142,8 +159,7 @@ func oboxKeyList(store *tunnel.AuthKeyStore) int {
 func oboxKeyAdd(store *tunnel.AuthKeyStore, line string) int {
 	k, err := store.Add(line, oboxKeyAddedBy())
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "添加失败：%v\n", err)
-		return 1
+		return reportError("添加失败", err)
 	}
 	fmt.Printf("已授权 %s\n  %s\n", displayName(k.Name), k.FP)
 	return 0
@@ -156,8 +172,7 @@ func oboxKeyAdd(store *tunnel.AuthKeyStore, line string) int {
 func oboxKeyReset(store *tunnel.AuthKeyStore, line string) int {
 	k, err := store.Reset(line, "enroll")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "设置失败：%v\n", err)
-		return 1
+		return reportError("设置失败", err)
 	}
 	fmt.Printf("已重置为仅授权 %s\n  %s\n", displayName(k.Name), k.FP)
 	return 0
@@ -165,8 +180,7 @@ func oboxKeyReset(store *tunnel.AuthKeyStore, line string) int {
 
 func oboxKeyRemove(store *tunnel.AuthKeyStore, fp string) int {
 	if err := store.Remove(fp); err != nil {
-		fmt.Fprintf(os.Stderr, "移除失败：%v\n", err)
-		return 1
+		return reportError("移除失败", err)
 	}
 	fmt.Printf("已移除 %s\n", fp)
 	return 0
