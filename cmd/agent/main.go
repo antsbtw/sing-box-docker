@@ -289,7 +289,29 @@ func (a *Agent) startHTTPServer() {
 
 	// 健康检查
 	healthServer := api.NewHealthServer(func() bool {
-		return a.manager.IsRunning() || os.Getenv("SKIP_SINGBOX") == "true"
+		// ⚠️ 判据必须反映**实际状态**，不能只看启动时的环境变量。
+		//
+		// 原来是 `IsRunning() || SKIP_SINGBOX=="true"`。问题在于：
+		// token 接入默认不装 sing-box，unit 里带 SKIP_SINGBOX=true；
+		// 用户之后从 App 把 sing-box 装上，**那个变量不会更新**。
+		// 于是 sing-box 每秒崩一次，/health 仍然回 healthy。
+		//
+		// 谎报健康比不报健康更糟 —— 真机排查时它把我们引向了
+		// 完全错误的方向，白查了很久。
+		//
+		// 现在：放弃重启时一律 unhealthy；没装 sing-box 才认
+		// SKIP_SINGBOX（用二进制在不在来判断，而不是那个变量）。
+		if a.manager.GaveUp() {
+			return false
+		}
+		if a.manager.IsRunning() {
+			return true
+		}
+		// 进程没在跑：只有"这台机器本就没装 sing-box"才算健康
+		if _, err := os.Stat(a.cfg.SingboxBin); os.IsNotExist(err) {
+			return true // 没装，agent 自己健康就行
+		}
+		return false // 装了却没跑 —— 这是故障，不能报健康
 	})
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		healthServer.HandleHealth(w, r)

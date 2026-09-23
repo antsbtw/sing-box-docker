@@ -294,7 +294,9 @@ func (s *LocalAPIServer) generateVLESSUrl(u *local.LocalUser) string {
 	// 取实际配置值，不写死（契约 §8）
 	sni := s.nodeConfig.RealitySNI
 	if sni == "" {
-		sni = "www.microsoft.com"
+		// 与 config.LoadFromEnv 的默认值保持一致 —— 两处不一样
+		// 就会"服务端用 A、分享链接写 B"，客户端必然连不上。
+		sni = "www.apple.com"
 	}
 	params.Set("sni", sni)
 	params.Set("fp", "chrome")
