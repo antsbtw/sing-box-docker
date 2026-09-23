@@ -47,7 +47,14 @@ type Server struct {
 	// ServerTime 返回当前时间的权威值，来自最近一次 poll 的 server_time。
 	// 不信本机时钟：VPS 时钟漂移会让合法凭据被拒或过期凭据被放行。
 	ServerTime func() time.Time
+
+	// authKeys 是设备持钥（owner key）的授权列表。
+	// 非 nil 时启用 publickey 认证 —— 裁决权在本机，后端签不出钥匙。
+	authKeys *AuthKeyStore
 }
+
+// EnableOwnerKeys 启用设备持钥认证。
+func (s *Server) EnableOwnerKeys(store *AuthKeyStore) { s.authKeys = store }
 
 // NewServer 用 node_secret 派生主机密钥（契约 §2.3 / A-2）。
 //
@@ -89,13 +96,49 @@ func (s *Server) tunnelKey() (ed25519.PublicKey, string) {
 // sessionID 用于把凭据绑定到本会话：A 会话的凭据不能拿到 B 会话用。
 func (s *Server) Serve(conn net.Conn, sessionID string) error {
 	pubkey, keyID := s.tunnelKey()
-	if pubkey == nil {
-		return errors.New("尚未收到后端的 tunnel_pubkey，无法验证凭据")
+
+	// 没有后端公钥不再是致命错误：owner key 方案下 password 认证会被
+	// 整条删掉，那时 tunnel_pubkey 本就不存在。只要有设备钥匙就能开。
+	// 两者都没有才是真的进不去。
+	if pubkey == nil && s.authKeys == nil {
+		return errors.New("既无后端 tunnel_pubkey 也无设备钥匙，无法认证")
 	}
 
-	cfg := &ssh.ServerConfig{
-		// 契约 §2.3：仅 password 方法。不接受 publickey、不接受系统密码。
-		PasswordCallback: func(c ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+	cfg := &ssh.ServerConfig{}
+
+	// ── publickey：设备持钥（owner key 方案）────────────────────────
+	//
+	// 钥匙只存在用户设备上，后端既签不出也拿不到 ——
+	// 后端即使被完全攻破也进不去这台机器。
+	// 裁决依据是本机的 authorized_keys.json，不是任何远端下发的东西。
+	if s.authKeys != nil {
+		cfg.PublicKeyCallback = func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if c.User() != sshUsername {
+				return nil, errAuthFailed
+			}
+			k, ok := s.authKeys.Authorized(key)
+			if !ok {
+				// 只记指纹，不回具体原因 —— 免得帮攻击者逐项试探
+				log.Printf("[tunnel] 未授权的设备钥匙：%s", ssh.FingerprintSHA256(key))
+				return nil, errAuthFailed
+			}
+			log.Printf("[tunnel] 设备 %q 通过 publickey 认证（%s）", k.Name, k.FP)
+			// 把本会话的指纹传下去，obox-key 用它记 added_by（审计用，不是门槛）
+			return &ssh.Permissions{
+				Extensions: map[string]string{"owner-key-fp": k.FP},
+			}, nil
+		}
+	}
+
+	// ── password：后端签发的一次性凭据（v1，迁移期保留）──────────────
+	//
+	// owner key 方案（§7）要求最终删掉这条 —— 它正是「后端被攻破
+	// 即可进入任何机器」的来源。但现网节点还在用它，两边同时切
+	// 会让所有存量节点立刻开不了终端。
+	//
+	// TODO(owner-key §7)：App 发版、用户重装完成之后删除本分支。
+	if pubkey != nil {
+		cfg.PasswordCallback = func(c ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
 			if c.User() != sshUsername {
 				return nil, errAuthFailed
 			}
@@ -108,8 +151,9 @@ func (s *Server) Serve(conn net.Conn, sessionID string) error {
 				return nil, errAuthFailed
 			}
 			return nil, nil
-		},
+		}
 	}
+
 	cfg.AddHostKey(s.hostKey)
 
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, cfg)
