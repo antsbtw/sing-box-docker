@@ -52,8 +52,12 @@ func TestRevokeWithoutShutdownHandle(t *testing.T) {
 	}
 }
 
-// T-3：token 模式下管理面只绑回环，不暴露在公网。
-func TestTokenModeBindsLoopback(t *testing.T) {
+// isTokenMode 的口径要与 startEnrollment 一致（配了 token，或已接入）。
+//
+// 注：它一度被用来决定管理面绑不绑回环（v1.12.3 的 T-3），
+// 那个用法已撤销 —— 收回回环会让 App 直连不到 8080，
+// 用户管理直接坏掉。这里只验判定本身。
+func TestTokenModeDetection(t *testing.T) {
 	dir := t.TempDir()
 	cwd, _ := os.Getwd()
 	defer os.Chdir(cwd)

@@ -295,15 +295,21 @@ func (a *Agent) startHTTPServer() {
 		log.Println("Local API routes registered")
 	}
 
-	// token 模式下把管理面收回回环。
+	// 管理面监听所有网卡（恢复 v1.12.2 及之前的行为）。
 	//
-	// App 经反向隧道进来，不再直连 8080；绑在所有网卡上只是把
-	// node_api_key 保护的管理面白白暴露在公网（联调 T-3）。
-	// 存量 API-Key 模式仍需外部可达，保持原样。
+	// ⚠️ v1.12.3（联调 T-3）曾把 token 模式改成只绑 127.0.0.1，
+	// 依据是后端那句「token 模式下 App 不再直连 8080」——
+	// **那个前提不成立**。用户管理（建用户、查流量）一直靠 App
+	// 直连这个端口；契约 §2.2 也写明 NODE_API_KEY 是
+	// 「本地 /api/local/* 鉴权」用的、仅本机生成不上报。
+	// 收回回环之后 App 够不着，用户管理直接坏掉。
+	//
+	// 正确的边界不是关掉端口，而是：
+	//   1) api-key 鉴权（32 hex 随机，仅本机生成，不上报后端）
+	//   2) 云厂商防火墙只放行需要的来源
+	//   3) TODO：把 api-key 与具体客户端配对，非配对客户端一律拒绝
+	//      —— 这样即便端口可达，别的客户端也连不上。
 	addr := ":8080"
-	if isTokenMode() {
-		addr = "127.0.0.1:8080"
-	}
 
 	go func() {
 		log.Printf("HTTP server starting on %s", addr)
