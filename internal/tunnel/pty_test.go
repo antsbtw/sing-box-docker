@@ -2,7 +2,9 @@ package tunnel
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -339,4 +341,135 @@ func TestExecCompletesWithoutClosingStdin(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("客户端不关写端时 exec 卡死 —— cmd.Stdin 不能接 channel")
 	}
+}
+
+// direct-tcpip：只允许回环目标。
+//
+// 不限制的话隧道就成了进入用户内网的通用代理 —— 凭据泄漏时攻击者
+// 能访问 VPS 私有网络里的任何主机，云元数据服务
+// 169.254.169.254 尤其危险（能取到实例凭据）。
+func TestLoopbackHostDetection(t *testing.T) {
+	allowed := []string{"127.0.0.1", "localhost", "::1", "127.1.2.3"}
+	for _, h := range allowed {
+		if !isLoopbackHost(h) {
+			t.Errorf("%q 应被允许（回环）", h)
+		}
+	}
+
+	denied := []string{
+		"169.254.169.254", // 云元数据服务
+		"10.0.0.5",        // 私网
+		"192.168.1.1",
+		"8.8.8.8",
+		"example.com",
+		"", // 空
+	}
+	for _, h := range denied {
+		if isLoopbackHost(h) {
+			t.Errorf("%q 必须被拒 —— 非回环目标会把隧道变成内网代理", h)
+		}
+	}
+}
+
+// 经 direct-tcpip 能连到本机端口并收发数据。
+func TestDirectTCPIPForwardsToLoopback(t *testing.T) {
+	// 起一个本地回声服务，模拟 agent 的 127.0.0.1:8080 管理面
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 64)
+		n, _ := c.Read(buf)
+		_, _ = c.Write(buf[:n])
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "fwd1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	conn, err := client.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		t.Fatalf("direct-tcpip 连本机端口失败：%v", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 16)
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	n, err := conn.Read(buf)
+	if err != nil {
+		t.Fatalf("读回显失败：%v", err)
+	}
+	if string(buf[:n]) != "ping" {
+		t.Errorf("收到 %q，应为 ping", buf[:n])
+	}
+}
+
+// 非回环目标必须被拒 —— 而且要因为「被拒」失败，不是因为「连不上」。
+//
+// ⚠️ 第一版这个测试打的是 169.254.169.254:80，去掉限制也照样失败
+// （那地址本来就连不通），等于没测。改为在本机起一个真实可连的监听，
+// 用非回环地址去指它：限制在，被拒；限制不在，连得通。
+func TestDirectTCPIPRejectsNonLoopback(t *testing.T) {
+	// 找一个本机的非回环地址（局域网 IP）
+	nonLoopback := firstNonLoopbackIP(t)
+
+	ln, err := net.Listen("tcp", nonLoopback+":0")
+	if err != nil {
+		t.Skipf("无法在 %s 上监听：%v", nonLoopback, err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = c.Write([]byte("reached"))
+			_ = c.Close()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "fwd2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// 这个地址是真实可连的 —— 只有回环限制能拦住它
+	conn, err := client.Dial("tcp", fmt.Sprintf("%s:%d", nonLoopback, port))
+	if err == nil {
+		conn.Close()
+		t.Fatal("非回环目标必须被拒 —— 否则隧道成了进入用户内网的代理")
+	}
+}
+
+func firstNonLoopbackIP(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skip("取不到网卡地址")
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && !n.IP.IsLoopback() && n.IP.To4() != nil {
+			return n.IP.String()
+		}
+	}
+	t.Skip("没有非回环 IPv4 地址")
+	return ""
 }

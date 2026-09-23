@@ -121,8 +121,16 @@ func (s *Server) Serve(conn net.Conn, sessionID string) error {
 	go ssh.DiscardRequests(reqs)
 
 	for newChan := range chans {
+		// direct-tcpip：App 访问本机管理面（127.0.0.1:8080）用。
+		//
+		// token 模式下本地 API 只绑回环（T-3，不把 node_api_key 保护的
+		// 管理面暴露在公网），App 因此够不着它 —— 走隧道转发是正路。
+		if newChan.ChannelType() == "direct-tcpip" {
+			go s.handleDirectTCPIP(newChan)
+			continue
+		}
 		if newChan.ChannelType() != "session" {
-			_ = newChan.Reject(ssh.UnknownChannelType, "only session is supported")
+			_ = newChan.Reject(ssh.UnknownChannelType, "only session/direct-tcpip are supported")
 			continue
 		}
 		ch, chReqs, err := newChan.Accept()
@@ -136,6 +144,71 @@ func (s *Server) Serve(conn net.Conn, sessionID string) error {
 }
 
 var errAuthFailed = errors.New("authentication failed")
+
+// directTCPIPPayload 是 RFC 4254 §7.2 的 direct-tcpip 负载。
+type directTCPIPPayload struct {
+	DestHost   string
+	DestPort   uint32
+	OriginHost string
+	OriginPort uint32
+}
+
+// handleDirectTCPIP 把一条 TCP 转发接到本机端口。
+//
+// ⚠️ **只允许回环目标。**
+//
+// 不限制的话，这条隧道就变成一个进入用户内网的通用代理：
+// 凭据一旦泄漏，攻击者能借它访问 VPS 所在私有网络里的任何主机
+// （云厂商的元数据服务 169.254.169.254 尤其危险，能取到实例凭据）。
+// App 需要的只是本机管理面，回环足够。
+func (s *Server) handleDirectTCPIP(newChan ssh.NewChannel) {
+	var p directTCPIPPayload
+	if err := ssh.Unmarshal(newChan.ExtraData(), &p); err != nil {
+		_ = newChan.Reject(ssh.ConnectionFailed, "bad direct-tcpip payload")
+		return
+	}
+
+	if !isLoopbackHost(p.DestHost) {
+		log.Printf("[tunnel] 拒绝非回环转发：%s:%d", p.DestHost, p.DestPort)
+		_ = newChan.Reject(ssh.Prohibited, "only loopback destinations are allowed")
+		return
+	}
+
+	target := net.JoinHostPort(p.DestHost, fmt.Sprintf("%d", p.DestPort))
+	conn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		log.Printf("[tunnel] direct-tcpip 连 %s 失败：%v", target, err)
+		_ = newChan.Reject(ssh.ConnectionFailed, err.Error())
+		return
+	}
+
+	ch, reqs, err := newChan.Accept()
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	go ssh.DiscardRequests(reqs)
+
+	var once sync.Once
+	done := make(chan struct{})
+	stop := func() { once.Do(func() { close(done) }) }
+
+	go func() { _, _ = io.Copy(conn, ch); stop() }()
+	go func() { _, _ = io.Copy(ch, conn); stop() }()
+
+	<-done
+	_ = conn.Close()
+	_ = ch.Close()
+}
+
+// isLoopbackHost 判断目标是不是本机回环。
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
 
 // handleSession 处理一个 SSH session channel：PTY shell 或 exec。
 func (s *Server) handleSession(ch ssh.Channel, reqs <-chan *ssh.Request) {
