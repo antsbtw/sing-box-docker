@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +23,7 @@ func newServerPair(t *testing.T) (*Server, ed25519.PrivateKey, string, string) {
 	}
 	const nodeID, sessionID = "byo-test01", "sess-abc"
 
-	srv, err := NewServer(nodeID, "node-secret-xyz", NewCredVerifier())
+	srv, err := NewServer(nodeID, "node-secret-xyz", t.TempDir(), NewCredVerifier())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,25 +156,95 @@ func TestSSHServerRejectsWrongUsername(t *testing.T) {
 	}
 }
 
-// A-2：主机密钥从 node_secret 派生，同 secret 必须得到同一指纹 ——
-// 否则客户端每次都会弹"主机密钥已更改"。
-func TestHostKeyIsDerivedAndStable(t *testing.T) {
-	s1, err := NewServer("n", "same-secret", NewCredVerifier())
+func fpOf(t *testing.T, s *Server) string {
+	t.Helper()
+	return ssh.FingerprintSHA256(s.hostKey.PublicKey())
+}
+
+// A-2：同一台机器重启，指纹必须不变。
+func TestHostKeyStableAcrossRestarts(t *testing.T) {
+	dir := t.TempDir()
+	s1, err := NewServer("n", "secret-a", dir, NewCredVerifier())
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, _ := NewServer("n", "same-secret", NewCredVerifier())
-	s3, _ := NewServer("n", "different-secret", NewCredVerifier())
+	s2, _ := NewServer("n", "secret-a", dir, NewCredVerifier())
 
-	fp1 := ssh.FingerprintSHA256(s1.hostKey.PublicKey())
-	fp2 := ssh.FingerprintSHA256(s2.hostKey.PublicKey())
-	fp3 := ssh.FingerprintSHA256(s3.hostKey.PublicKey())
-
-	if fp1 != fp2 {
-		t.Error("同一 node_secret 应派生出相同的主机密钥")
+	if fpOf(t, s1) != fpOf(t, s2) {
+		t.Error("同一台机器重启后指纹必须一致")
 	}
-	if fp1 == fp3 {
-		t.Error("不同 node_secret 应派生出不同的主机密钥")
+}
+
+// ⚠️ 这是改用本机种子的**全部意义**：
+// 带 token 重装会让后端轮换 node_secret（install.sh H-3 删 node.json
+// → agent 重新注册 → 后端按 machine_id 去重并换 secret）。
+//
+// 旧实现从 node_secret 派生，于是每次重装都换指纹，App 每次都弹
+// "主机密钥已更改"。一个每次都要点确认的安全提示等于没有提示 ——
+// 用户会习惯性点"信任"，真有人冒充时也照点不误。
+func TestHostKeySurvivesSecretRotation(t *testing.T) {
+	dir := t.TempDir()
+	before, err := NewServer("n", "secret-before-reinstall", dir, NewCredVerifier())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 重装：node_secret 换了，data/ 里的种子还在
+	after, _ := NewServer("n", "secret-AFTER-reinstall", dir, NewCredVerifier())
+
+	if fpOf(t, before) != fpOf(t, after) {
+		t.Error("后端轮换 node_secret 不该改变指纹 —— 否则每次重装都告警，" +
+			"而每次都要点的提示等于没有提示")
+	}
+}
+
+// 换机器（或 data/ 被清空）指纹必须变 —— 那才是真信号。
+func TestHostKeyChangesOnNewMachine(t *testing.T) {
+	a, err := NewServer("n", "same-secret", t.TempDir(), NewCredVerifier())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := NewServer("n", "same-secret", t.TempDir(), NewCredVerifier())
+
+	if fpOf(t, a) == fpOf(t, b) {
+		t.Error("不同机器应有不同指纹 —— 否则 pin 分辨不出冒充")
+	}
+}
+
+// 种子文件权限必须是 0600：拿到它就能冒充这台机器。
+func TestHostKeySeedPermissions(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := NewServer("n", "s", dir, NewCredVerifier()); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := os.Stat(filepath.Join(dir, hostKeySeedFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("种子权限应为 0600，实际 %o —— 拿到它就能冒充这台机器", perm)
+	}
+}
+
+// 种子文件损坏时重新生成，而不是让 agent 起不来。
+//
+// 指纹变化只需用户确认一次；起不来则整台机器失联 —— 两害相权取其轻。
+func TestCorruptSeedRegenerates(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := NewServer("n", "s", dir, NewCredVerifier()); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, hostKeySeedFileName)
+	if err := os.WriteFile(path, []byte("not-hex-garbage"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := NewServer("n", "s", dir, NewCredVerifier())
+	if err != nil {
+		t.Fatalf("种子损坏不该让 agent 起不来：%v", err)
+	}
+	if srv.hostKey == nil {
+		t.Error("应重新生成可用的主机密钥")
 	}
 }
 

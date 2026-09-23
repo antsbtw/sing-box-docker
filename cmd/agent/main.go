@@ -908,7 +908,8 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 	// 所以不会扩大这台机器的攻击面。
 	var setupTunnel func(nodeID, nodeSecret string) error
 	setupTunnel = func(nodeID, nodeSecret string) error {
-		srv, err := tunnel.NewServer(nodeID, nodeSecret, tunnel.NewCredVerifier())
+		// dataDir 传进去：主机密钥从本机种子派生，重装不换指纹
+		srv, err := tunnel.NewServer(nodeID, nodeSecret, dataDir, tunnel.NewCredVerifier())
 		if err != nil {
 			return err
 		}

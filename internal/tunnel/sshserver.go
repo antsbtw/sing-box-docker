@@ -8,7 +8,9 @@ package tunnel
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,24 +59,34 @@ type Server struct {
 // EnableOwnerKeys 启用设备持钥认证。
 func (s *Server) EnableOwnerKeys(store *AuthKeyStore) { s.authKeys = store }
 
-// NewServer 用 node_secret 派生主机密钥（契约 §2.3 / A-2）。
+// hostKeySeedFileName 是主机密钥种子的文件名（放 data/ 下）。
+const hostKeySeedFileName = "host_key_seed"
+
+// NewServer 用**本机种子**派生主机密钥（契约 §2.3 / A-2）。
 //
-// 派生而非随机生成：只要 secret 不变，重启后指纹就不变。
+// ⚠️ 这里曾用 node_secret 派生，那是个会让 TOFU pin 失效的选择：
 //
-// ⚠️ 但"重装后指纹不变"**不成立**，这条注释此前的说法有误导性：
 // 带 token 重装时 install.sh 会删掉 node.json（H-3，契约 §2.4 第 0 步），
-// agent 重新注册，而后端按 machine_id 去重并**轮换 secret**
-// —— 所以每次带 token 重装都会换指纹。
+// agent 重新注册，后端按 machine_id 去重并**轮换 secret** ——
+// 于是**每次重装都换指纹**，App 每次都弹"主机密钥已更改"。
 //
-// 后果是 App 侧的 TOFU pin 每次重装都告警。一个每次都要点确认的
-// 安全提示等于没有提示，真有人冒充时用户也会照点不误。
+// 一个每次都要点确认的安全提示等于没有提示：用户会习惯性点"信任"，
+// 真有人冒充时也照点不误。真机上反复重装时就是这样。
 //
-// TODO：改为从一个装机生成、重装保留的本地种子派生
-// （放 data/ 下，与 authorized_keys.json 同等对待），
-// 让指纹只在真正换机器时才变。切换那一版会让现存节点指纹变一次。
-func NewServer(nodeID, nodeSecret string, verifier *CredVerifier) (*Server, error) {
-	seed := sha256.Sum256([]byte(hostKeySeedContext + nodeSecret))
-	priv := ed25519.NewKeyFromSeed(seed[:])
+// 改为本机种子之后：
+//   - 重装、重启、后端轮换 secret → 指纹不变，不打扰用户
+//   - 换机器、data/ 被清空 → 指纹变，**那时的告警才是真信号**
+//
+// 种子与 authorized_keys.json 同等对待：只存本机、0600、
+// install.sh 的清理不碰它。
+//
+// dataDir 为空时退回 node_secret 派生（仅用于测试，生产必传）。
+func NewServer(nodeID, nodeSecret, dataDir string, verifier *CredVerifier) (*Server, error) {
+	seed, err := loadOrCreateHostKeySeed(dataDir, nodeSecret)
+	if err != nil {
+		return nil, err
+	}
+	priv := ed25519.NewKeyFromSeed(seed)
 
 	signer, err := ssh.NewSignerFromKey(priv)
 	if err != nil {
@@ -86,6 +99,51 @@ func NewServer(nodeID, nodeSecret string, verifier *CredVerifier) (*Server, erro
 		hostKey:    signer,
 		ServerTime: time.Now,
 	}, nil
+}
+
+// loadOrCreateHostKeySeed 读取本机种子，没有就生成一把并落盘。
+//
+// dataDir 为空时退回旧行为（从 node_secret 派生），只为让不关心
+// 持久化的测试仍可直接构造 Server。
+func loadOrCreateHostKeySeed(dataDir, nodeSecret string) ([]byte, error) {
+	if dataDir == "" {
+		sum := sha256.Sum256([]byte(hostKeySeedContext + nodeSecret))
+		return sum[:], nil
+	}
+
+	path := filepath.Join(dataDir, hostKeySeedFileName)
+
+	// 已有就用它 —— 这是"重装后指纹不变"的关键
+	if raw, err := os.ReadFile(path); err == nil {
+		if decoded, derr := hex.DecodeString(strings.TrimSpace(string(raw))); derr == nil && len(decoded) == ed25519.SeedSize {
+			return decoded, nil
+		}
+		// 文件坏了：重新生成而不是报错退出。
+		// 报错会让 agent 起不来，而指纹变化只是需要用户确认一次 ——
+		// 两害相权取其轻。
+		log.Printf("[tunnel] %s 内容无效，重新生成（指纹会变一次）", hostKeySeedFileName)
+	}
+
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, fmt.Errorf("generate host key seed: %w", err)
+	}
+
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	// 先写临时文件再 rename：中途断电不会留下半个种子，
+	// 而半个种子意味着下次启动指纹又变一次。
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(hex.EncodeToString(seed)), 0o600); err != nil {
+		return nil, fmt.Errorf("write host key seed: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("persist host key seed: %w", err)
+	}
+
+	log.Printf("[tunnel] 已生成本机主机密钥种子（%s）", path)
+	return seed, nil
 }
 
 // SetTunnelKey 更新后端的凭据签名公钥（契约 §3.3，随每次 poll 下发）。
