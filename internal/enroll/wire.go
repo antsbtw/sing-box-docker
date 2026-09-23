@@ -63,6 +63,17 @@ type PollStatus struct {
 	UserCount      int            `json:"user_count"`
 	UptimeS        int64          `json:"uptime_s"`
 	Load1          float64        `json:"load1"`
+
+	// OwnerKeys 是本机授权设备的**指纹与名字**，供 App 展示
+	// 「哪些设备已授权」（owner key 设计 §5）。
+	//
+	// ⚠️ 只上报指纹，公钥本体不出机器；后端只存不判 ——
+	// 授权裁决永远在本机做。空数组的语义是「没有任何设备被授权」，
+	// App 据此把节点显示为「可见但进不去，请重装以启用终端」。
+	//
+	// 必须始终带上（不能 omitempty）：省略与空数组在后端看来是两回事，
+	// 省略会让后端保留上一次的旧列表，删掉的钥匙就还显示在 App 上。
+	OwnerKeys []map[string]string `json:"owner_keys"`
 }
 
 // UserStat 单用户流量。

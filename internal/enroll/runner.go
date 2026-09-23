@@ -50,6 +50,12 @@ type Runner struct {
 	// SingboxRunning 报告数据面是否正常（/health 的同一判据）
 	SingboxRunning func() bool
 
+	// OwnerKeys 报告本机授权设备的指纹与名字（owner key 设计 §5）。
+	// 以函数注入而非直接读文件：避免 enroll 依赖 tunnel 包，
+	// 也让「每次 poll 读一次最新列表」这件事显而易见 ——
+	// 用户刚用 obox-key 删掉一把，下一次 poll 就该看到。
+	OwnerKeys func() []map[string]string
+
 	// DetectIP 自测公网 IP，为空则用默认实现。
 	// 可注入主要是为了让测试不依赖外网。
 	DetectIP func(context.Context) string
@@ -393,11 +399,26 @@ func (r *Runner) pollOnce(ctx context.Context, wait int) (*PollResponse, error) 
 			ListenPorts:    r.Info.ListenPorts(),
 			UserCount:      r.Store.UserCount(),
 			UptimeS:        int64(time.Since(r.startedAt).Seconds()),
+			OwnerKeys:      r.ownerKeys(),
 		},
 		Stats: r.collectStats(),
 		Acks:  append([]CommandAck(nil), r.pendingAcks...),
 	}
 	return r.Client.Poll(ctx, r.node.PollURL, r.node.NodeSecret, wait, req)
+}
+
+// ownerKeys 取本机授权列表的上报形式。
+//
+// 一律返回非 nil：nil 会编码成 JSON null，而后端约定的「没有任何
+// 设备被授权」是空数组 []。两者在后端的解析里不是一回事。
+func (r *Runner) ownerKeys() []map[string]string {
+	if r.OwnerKeys == nil {
+		return []map[string]string{}
+	}
+	if keys := r.OwnerKeys(); keys != nil {
+		return keys
+	}
+	return []map[string]string{}
 }
 
 // collectStats 读取本次 boot 以来的累计用量。

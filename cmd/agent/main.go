@@ -71,6 +71,15 @@ func (a *Agent) Revoked() bool {
 }
 
 func main() {
+	// obox-key 子命令：管理设备钥匙，不启动 agent。
+	//
+	// 必须放在最前面 —— 后面 LoadFromEnv 在缺 NODE_API_KEY 时会
+	// log.Fatal，而用户在命令行敲 obox-key 时没有那些环境变量。
+	// 通过 /usr/local/bin/obox-key 软链调用时 os.Args[0] 以 obox-key 结尾。
+	if isOboxKeyInvocation() {
+		os.Exit(runOboxKey(oboxKeyArgs()))
+	}
+
 	log.Println("========================================")
 	log.Println("  OTun Node Agent v1.1.0")
 	log.Println("========================================")
@@ -851,6 +860,11 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		})
 	}
 
+	// 设备钥匙列表：SSH 服务端拿它判授权，poll 拿它上报指纹。
+	// 同一个 store 实例共享给两边 —— 它自身并发安全，
+	// 而且读的始终是磁盘上的最新内容（用户刚 obox-key rm 就该立刻生效）。
+	authKeys := tunnel.NewAuthKeyStore(dataDir)
+
 	runner := &enroll.Runner{
 		DataDir:        dataDir,
 		ExePath:        exePath,
@@ -863,6 +877,7 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		Stats:          statsAdapter{c: a.collector},
 		Store:          storeAdapter{s: a.localStore},
 		SingboxRunning: a.manager.IsRunning,
+		OwnerKeys:      authKeys.Fingerprints,
 	}
 
 	// ── 反向隧道（tunnel v1）──────────────────────────────
@@ -877,6 +892,11 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		}
 		// 凭据有效期以**后端时间**判定，不信本机时钟（契约 §3.2 第 4 条）
 		srv.ServerTime = time.Now
+
+		// 设备持钥认证（owner key §3.2）：授权与否只看本机这份列表。
+		// 列表为空 = 谁都进不去 —— 无 --owner-key 装出来的节点就是这样，
+		// 那是合法状态，不是故障。
+		srv.EnableOwnerKeys(authKeys)
 
 		a.sshServer = srv
 		a.tunnelMgr = tunnel.NewManager(nodeID, nodeSecret, srv, 3)
