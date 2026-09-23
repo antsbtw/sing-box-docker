@@ -368,7 +368,18 @@ func (s *Server) runExec(ch ssh.Channel, command string, p *ptyRequest) {
 	cmd.Dir = homeDir()
 
 	if p == nil {
-		cmd.Stdin = ch
+		// ⚠️ 不能写 cmd.Stdin = ch。
+		//
+		// 那样 cmd.Run() 会等 stdin 到 EOF —— 而 SSH channel 只有在
+		// 客户端主动半关闭时才 EOF。很多客户端（包括本 App 的
+		// executeCommand）发完 exec 请求就等结果、不关写端，
+		// 于是命令跑完了 cmd.Run() 仍卡在复制 stdin 上，
+		// 两边对着等，channel 永不关闭（2026-09-23 真机实测：
+		// `id -u` 卡死，客户端日志停在「子通道已建立，等待关闭」）。
+		//
+		// 非交互命令本来也不需要从 channel 读输入：要交互就该用 pty。
+		// 所以这里把 stdin 接到空。
+		cmd.Stdin = nil
 		cmd.Stdout = ch
 		cmd.Stderr = ch.Stderr()
 

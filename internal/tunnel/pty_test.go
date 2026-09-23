@@ -296,3 +296,47 @@ func TestExecExitStatus(t *testing.T) {
 		t.Errorf("退出码 = %d，应为 7", ee.ExitStatus())
 	}
 }
+
+// 客户端不关写端时，exec 也必须能正常结束。
+//
+// 这是真机卡死的那个：原来 cmd.Stdin = ch，cmd.Run() 会等 stdin 到 EOF，
+// 而 SSH channel 只有客户端主动半关闭才 EOF。App 的 executeCommand
+// 发完请求就等结果、从不关写端，于是命令跑完了 Run() 仍卡在复制 stdin 上，
+// 两边对着等，channel 永不关闭。
+//
+// 已有的 TestExecExitStatus 用 sess.Run()，x/crypto/ssh 会替你关写端，
+// 所以一直是绿的 —— 覆盖不到这个场景。
+func TestExecCompletesWithoutClosingStdin(t *testing.T) {
+	srv, priv, nodeID, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "noclose"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	sess, err := client.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	// 故意接一个永不关闭的 stdin，模拟 App 的行为
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	sess.Stdin = pr
+
+	out := make(chan string, 1)
+	go func() {
+		b, _ := sess.Output("id -u")
+		out <- strings.TrimSpace(string(b))
+	}()
+
+	select {
+	case got := <-out:
+		if got == "" {
+			t.Error("应当拿到输出")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("客户端不关写端时 exec 卡死 —— cmd.Stdin 不能接 channel")
+	}
+}
