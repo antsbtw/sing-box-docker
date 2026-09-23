@@ -58,9 +58,19 @@ func (s *Server) EnableOwnerKeys(store *AuthKeyStore) { s.authKeys = store }
 
 // NewServer 用 node_secret 派生主机密钥（契约 §2.3 / A-2）。
 //
-// 派生而非随机生成：重装后只要 secret 不变，指纹就不变，
-// 客户端不会弹"主机密钥已更改"。secret 轮换时指纹会变，
-// App 侧需按 node_id 记指纹并在 reenrolled 后刷新。
+// 派生而非随机生成：只要 secret 不变，重启后指纹就不变。
+//
+// ⚠️ 但"重装后指纹不变"**不成立**，这条注释此前的说法有误导性：
+// 带 token 重装时 install.sh 会删掉 node.json（H-3，契约 §2.4 第 0 步），
+// agent 重新注册，而后端按 machine_id 去重并**轮换 secret**
+// —— 所以每次带 token 重装都会换指纹。
+//
+// 后果是 App 侧的 TOFU pin 每次重装都告警。一个每次都要点确认的
+// 安全提示等于没有提示，真有人冒充时用户也会照点不误。
+//
+// TODO：改为从一个装机生成、重装保留的本地种子派生
+// （放 data/ 下，与 authorized_keys.json 同等对待），
+// 让指纹只在真正换机器时才变。切换那一版会让现存节点指纹变一次。
 func NewServer(nodeID, nodeSecret string, verifier *CredVerifier) (*Server, error) {
 	seed := sha256.Sum256([]byte(hostKeySeedContext + nodeSecret))
 	priv := ed25519.NewKeyFromSeed(seed[:])
