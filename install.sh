@@ -75,6 +75,7 @@ NODE_ID="node-$(hostname)"
 VLESS_PORT=443
 MANAGEMENT_MODE="local"
 SERVER_IP=""
+OWNER_KEY=""
 
 # 默认值
 API_URL="https://otun-manager.situstechnologies.com"
@@ -88,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --vless-port) VLESS_PORT="$2"; shift 2 ;;
         --management-mode) MANAGEMENT_MODE="$2"; shift 2 ;;
         --server-ip) SERVER_IP="$2"; shift 2 ;;
+        --owner-key) OWNER_KEY="$2"; shift 2 ;;
         --with-singbox) WITH_SINGBOX=1; shift ;;
         --no-singbox) WITH_SINGBOX=0; shift ;;
         --skip-checksum) SKIP_CHECKSUM=1; shift ;;
@@ -106,7 +108,7 @@ fi
 
 if [ -z "$NODE_API_KEY" ] && [ -z "$ENROLL_TOKEN" ]; then
     echo -e "${RED}Error: 需要 --api-key 或 --enroll-token${NC}"
-    echo "Usage: $0 --enroll-token <token> --api-url <url>"
+    echo "Usage: $0 --enroll-token <token> --api-url <url> [--owner-key \"ssh-ed25519 AAAA... 设备名\"]"
     echo "   or: $0 --api-key <key> [--node-id <id>] [--vless-port <port>] [--management-mode local|remote|hybrid] [--server-ip <ip>]"
     exit 1
 fi
@@ -280,6 +282,35 @@ chmod +x "$INSTALL_DIR/agent"
 
 # 创建数据目录
 mkdir -p $INSTALL_DIR/data
+
+# ─────────────────────────────────────────────────────────────
+# 设备钥匙(owner key 设计 §3.1、§3.3)
+#
+# --owner-key 带进来的是**执行这条安装命令的那台设备**的 SSH 公钥。
+# 私钥只在那台设备上,后端既签不出也拿不到 —— 这是本方案的全部意义。
+#
+# ⚠️ 必须在 systemctl start 之前写入:agent 一起来就可能被配对开隧道,
+# 那时列表若还是空的,第一次开终端会被拒,用户看到的是"装完了但进不去"。
+#
+# 用 Reset(覆盖)而非 Add(追加):重装即"从这台设备重新掌控"。
+# 机器换了人、或旧手机丢了,重装一次旧钥匙就全部失效。
+# ─────────────────────────────────────────────────────────────
+ln -sf "$INSTALL_DIR/agent" /usr/local/bin/obox-key
+
+if [ -n "$OWNER_KEY" ]; then
+    if OTUN_DATA_DIR="$INSTALL_DIR/data" "$INSTALL_DIR/agent" obox-key reset "$OWNER_KEY" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ 已授权本设备${NC}"
+    else
+        # 这里失败只有一个原因:公钥格式不对。继续装下去会得到一台
+        # "看得见进不去"的机器,用户要去云控制台才能救 —— 不如现在停。
+        echo -e "${RED}Error: --owner-key 不是有效的 SSH 公钥${NC}"
+        echo -e "${YELLOW}期望格式: ssh-ed25519 AAAAC3Nza... 设备名${NC}"
+        exit 1
+    fi
+else
+    echo -e "${YELLOW}提示: 未提供 --owner-key,这台机器暂时无法从 App 打开终端${NC}"
+    echo -e "${YELLOW}      需要时在本机执行: obox-key add \"<公钥>\"${NC}"
+fi
 
 if [ "$WITH_SINGBOX" = "1" ]; then
     mkdir -p /etc/sing-box

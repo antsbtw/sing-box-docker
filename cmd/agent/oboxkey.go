@@ -71,6 +71,15 @@ func runOboxKey(args []string) int {
 	case "list", "ls":
 		return oboxKeyList(store)
 
+	case "reset":
+		// install.sh --owner-key 用。故意不写进 usage：
+		// 它会清掉所有其他设备，不是日常操作。
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "用法：obox-key reset \"ssh-ed25519 AAAA… 设备名\"")
+			return 2
+		}
+		return oboxKeyReset(store, strings.Join(args[1:], " "))
+
 	case "add":
 		if len(args) < 2 {
 			fmt.Fprintln(os.Stderr, "用法：obox-key add \"ssh-ed25519 AAAA… 设备名\"")
@@ -137,6 +146,20 @@ func oboxKeyAdd(store *tunnel.AuthKeyStore, line string) int {
 		return 1
 	}
 	fmt.Printf("已授权 %s\n  %s\n", displayName(k.Name), k.FP)
+	return 0
+}
+
+// oboxKeyReset 把列表重置为仅这一把 —— 重装即「从这台设备重新掌控」。
+//
+// ⚠️ 这会让其他所有设备立刻失去访问。install.sh 调它是合理的
+// （用户正拿着那台设备执行安装命令），手敲则要清楚后果。
+func oboxKeyReset(store *tunnel.AuthKeyStore, line string) int {
+	k, err := store.Reset(line, "enroll")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "设置失败：%v\n", err)
+		return 1
+	}
+	fmt.Printf("已重置为仅授权 %s\n  %s\n", displayName(k.Name), k.FP)
 	return 0
 }
 
