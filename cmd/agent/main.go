@@ -470,12 +470,27 @@ func (a *Agent) regenerateConfig() {
 		return
 	}
 
-	// 重载 sing-box
+	// 重载 sing-box。
+	//
+	// 没在跑的话尝试启动 —— 这条分支是给「装完 sing-box」用的：
+	// v1.12.3 起 token 接入默认不装 sing-box，unit 里带 SKIP_SINGBOX=true，
+	// agent 启动时就跳过了它。之后用户从 App 经隧道把 sing-box 装上，
+	// 这时 agent 仍以为不该管它，装了也不会跑。
+	//
+	// 而想让 agent 重读 SKIP_SINGBOX 只能重启进程 —— 那会掐断
+	// App 正连着的隧道。所以改为：收到 reload 时按「二进制在不在」
+	// 判断，而不是认启动时的那个环境变量。
 	if a.manager.IsRunning() {
 		log.Println("Reloading sing-box...")
 		if err := a.manager.Reload(); err != nil {
 			log.Printf("Failed to reload sing-box: %v", err)
 		}
+	} else if err := a.manager.Start(); err != nil {
+		// 二进制不存在时 Start 会明确报错，这是常态（机器上本来就没装），
+		// 记一行即可，不当失败处理。
+		log.Printf("sing-box 未启动（可能尚未安装）：%v", err)
+	} else {
+		log.Println("检测到 sing-box 已安装，已启动")
 	}
 }
 
