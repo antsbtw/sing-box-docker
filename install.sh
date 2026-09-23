@@ -17,6 +17,25 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# 清理之前先把已有的本机 API 密钥抢救出来。
+#
+# ⚠️ 这个 key 是「机器身份」的一部分，不该每次重装都换。
+# App 装 sing-box 时会把它存进本地节点记录，之后靠它调
+# /api/local/* 管理用户。重装 agent 如果重新生成一个，
+# App 手里那份就失效了 —— 表现为「创建用户提示认证失败」，
+# 而用户完全看不出是重装把 key 换掉了（2026-09-23 真机踩到）。
+#
+# 下面 H-2 那段只在 PRESERVED_API_KEY 为空时才生成新的。
+PRESERVED_API_KEY=""
+if [ -f /etc/systemd/system/otun-agent.service ]; then
+    # 用 sed 而不是 grep -oP：精简镜像上未必有 PCRE 支持的 grep
+    PRESERVED_API_KEY=$(sed -n 's/.*NODE_API_KEY=\([^"]*\)".*/\1/p' \
+        /etc/systemd/system/otun-agent.service 2>/dev/null | head -1)
+    if [ -n "$PRESERVED_API_KEY" ]; then
+        echo -e "${GREEN}保留已有的本机 API 密钥（App 侧记录仍然有效）${NC}"
+    fi
+fi
+
 # 彻底清理已有环境
 echo -e "${YELLOW}Cleaning up existing installation...${NC}"
 
@@ -97,7 +116,12 @@ fi
 # 永远注册不上 —— 这条路径此前是走不通的。
 # 该密钥仅用于本机 /api/local/* 鉴权，不上报后端。
 if [ -n "$ENROLL_TOKEN" ] && [ -z "$NODE_API_KEY" ]; then
-    NODE_API_KEY=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    # 优先复用重装前那把 —— App 本地记录里存的就是它
+    if [ -n "$PRESERVED_API_KEY" ]; then
+        NODE_API_KEY="$PRESERVED_API_KEY"
+    else
+        NODE_API_KEY=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    fi
     if [ -z "$NODE_API_KEY" ]; then
         echo -e "${RED}无法生成本地 API 密钥（需要 openssl 或 /dev/urandom）${NC}"
         exit 1
