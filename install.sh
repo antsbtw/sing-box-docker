@@ -76,6 +76,9 @@ VLESS_PORT=443
 MANAGEMENT_MODE="local"
 SERVER_IP=""
 OWNER_KEY=""
+# --hosted:OBox 托管机(我们的 AWS 账号)。只由后端开通时传入。
+# 影响 agent 的两件事:接受 upgrade_agent(非托管机一律拒收),以及托管模式的验签闸门(v1.15.0)。
+OBOX_HOSTED="false"
 
 # 默认值
 API_URL="https://otun-manager.situstechnologies.com"
@@ -93,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --with-singbox) WITH_SINGBOX=1; shift ;;
         --no-singbox) WITH_SINGBOX=0; shift ;;
         --skip-checksum) SKIP_CHECKSUM=1; shift ;;
+        --hosted) OBOX_HOSTED="true"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -349,6 +353,7 @@ Environment="OTUN_API_URL=$API_URL"
 Environment="MANAGEMENT_MODE=$MANAGEMENT_MODE"
 Environment="SERVER_IP=$SERVER_IP"
 Environment="SKIP_SINGBOX=$SKIP_SINGBOX_ENV"
+Environment="OBOX_HOSTED=$OBOX_HOSTED"
 ExecStart=$INSTALL_DIR/agent
 Restart=always
 RestartSec=5

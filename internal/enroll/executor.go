@@ -2,8 +2,19 @@ package enroll
 
 // 指令执行。接线契约 §6。
 //
-// 指令集刻意与本地 /api/local/* 的动词一一对应：执行时直接调 local.Store，
-// 不新造一套用户管理逻辑。Token 模式与存量 API-Key 模式共用同一份状态。
+// ⚠️ **指令白名单**(v1.14.0,应用平台 09 §5.3):后端经长轮询能让 agent 做的事
+// 只有下面这几条,且都不执行任意代码:
+//
+//	ping、get_config、reload、open_tunnel —— 所有机器
+//	upgrade_agent                        —— 仅托管模式(OBOX_HOSTED=true)
+//
+// 其余一律回 unsupported_type。
+//
+// 四条用户指令(create_user / update_user / delete_user / reset_user_traffic)
+// 已整体删除:用户自己的机器上,后端不应能加 VPN 用户(等于能借用机器和带宽);
+// 所有机器的用户管理都经 App 直连本地 API(/api/local/*)。
+//
+// agent 仓库的发布权限等同于"能在全部 token 节点上执行代码"—— 本文件的任何放宽都要双人评审。
 
 import (
 	"context"
@@ -12,8 +23,6 @@ import (
 	"log"
 	"sync"
 	"time"
-
-	"otun-node-agent/internal/local"
 )
 
 // TunnelOpener 建立一条隧道。由 tunnel.Manager 实现。
@@ -33,7 +42,6 @@ type NodeInfoProvider interface {
 
 // Executor 执行后端下发的指令并生成回执。
 type Executor struct {
-	store        *local.Store
 	info         NodeInfoProvider
 	agentVersion string
 	reload       func() error
@@ -48,6 +56,8 @@ type Executor struct {
 	// tunnel 为 nil 时 open_tunnel 回 unsupported_type，
 	// 后端据此让 App 提示"请升级节点 agent"（tunnel v1 §2.1-3）。
 	tunnel TunnelOpener
+	// tunnel_url 只允许指向这个主机（--api-url 的主机名）
+	tunnelHost string
 
 	// 已完成指令的回执缓存。契约 §6.4：后端可能因回执丢失而重投，
 	// 重复收到时直接重放原回执，不要重新执行。
@@ -58,9 +68,8 @@ type Executor struct {
 
 const maxRecent = 200
 
-func NewExecutor(store *local.Store, info NodeInfoProvider, agentVersion string, reload func() error) *Executor {
+func NewExecutor(info NodeInfoProvider, agentVersion string, reload func() error) *Executor {
 	return &Executor{
-		store:        store,
 		info:         info,
 		agentVersion: agentVersion,
 		reload:       reload,
@@ -90,14 +99,6 @@ func (e *Executor) execute(cmd Command, serverTime time.Time) CommandAck {
 	}
 
 	switch cmd.Type {
-	case CmdCreateUser:
-		return e.createUser(cmd)
-	case CmdUpdateUser:
-		return e.updateUser(cmd)
-	case CmdDeleteUser:
-		return e.deleteUser(cmd)
-	case CmdResetUserTraffic:
-		return e.resetTraffic(cmd)
 	case CmdGetConfig:
 		return e.getConfig()
 	case CmdReload:
@@ -115,125 +116,6 @@ func (e *Executor) execute(cmd Command, serverTime time.Time) CommandAck {
 }
 
 // ── 各指令 ────────────────────────────────────────────────
-
-type createUserPayload struct {
-	UUID         string     `json:"uuid"`
-	Name         string     `json:"name"`
-	Protocols    []string   `json:"protocols"`
-	SSPassword   string     `json:"ss_password"`
-	TrafficLimit int64      `json:"traffic_limit"`
-	ExpireAt     *time.Time `json:"expire_at"`
-	Enabled      *bool      `json:"enabled"`
-}
-
-func (e *Executor) createUser(cmd Command) CommandAck {
-	var p createUserPayload
-	if err := decodePayload(cmd.Payload, &p); err != nil {
-		return failed(ErrInvalidPayload, err.Error())
-	}
-	if p.UUID == "" || p.SSPassword == "" {
-		return failed(ErrInvalidPayload, "uuid 与 ss_password 必填")
-	}
-
-	enabled := true
-	if p.Enabled != nil {
-		enabled = *p.Enabled
-	}
-
-	// ⚠️ 用后端给的 uuid / ss_password，不自生成 —— 后端要用同样的值
-	// 拼分享链接（契约 §6.2）
-	_, _, err := e.store.UpsertUser(&local.LocalUser{
-		UUID:         p.UUID,
-		Name:         p.Name,
-		Protocols:    p.Protocols,
-		SSPassword:   p.SSPassword,
-		Enabled:      enabled,
-		TrafficLimit: p.TrafficLimit,
-		ExpireAt:     p.ExpireAt,
-	})
-	switch {
-	case err == local.ErrUserConflict:
-		return failed(ErrUserExists, "uuid 已存在且字段不一致")
-	case err != nil:
-		return failed(ErrInternal, err.Error())
-	}
-	return done(map[string]any{"uuid": p.UUID})
-}
-
-type updateUserPayload struct {
-	UUID         string     `json:"uuid"`
-	Name         *string    `json:"name"`
-	Enabled      *bool      `json:"enabled"`
-	TrafficLimit *int64     `json:"traffic_limit"`
-	ExpireAt     *time.Time `json:"expire_at"`
-	Protocols    []string   `json:"protocols"`
-}
-
-func (e *Executor) updateUser(cmd Command) CommandAck {
-	var p updateUserPayload
-	if err := decodePayload(cmd.Payload, &p); err != nil {
-		return failed(ErrInvalidPayload, err.Error())
-	}
-	if p.UUID == "" {
-		return failed(ErrInvalidPayload, "uuid 必填")
-	}
-	if _, ok := e.store.GetUser(p.UUID); !ok {
-		return failed(ErrUserNotFound, "uuid 不存在")
-	}
-
-	req := &local.UpdateUserRequest{
-		Name:         p.Name,
-		Enabled:      p.Enabled,
-		TrafficLimit: p.TrafficLimit,
-		Protocols:    p.Protocols,
-	}
-
-	// expire_at 三态（契约 §6.2）：
-	//   字段缺席     → 不改
-	//   显式 null    → 永不过期
-	//   具体时间     → 直存绝对时间
-	//
-	// ⚠️ 不能换算成天数：已过去的时刻会算出负数、被夹成 0，
-	// 而 0 在 Store 里是"永不过期" —— "立即到期"就变成了"永久有效"。
-	if raw, present := cmd.Payload["expire_at"]; present {
-		if raw == nil {
-			req.ClearExpire = true
-		} else if p.ExpireAt != nil {
-			req.ExpireAt = p.ExpireAt
-		}
-	}
-
-	if _, err := e.store.UpdateUser(p.UUID, req); err != nil {
-		return failed(ErrInternal, err.Error())
-	}
-	return done(map[string]any{"uuid": p.UUID})
-}
-
-func (e *Executor) deleteUser(cmd Command) CommandAck {
-	uuid, _ := cmd.Payload["uuid"].(string)
-	if uuid == "" {
-		return failed(ErrInvalidPayload, "uuid 必填")
-	}
-	// 幂等（契约 §6.4）：不存在即视为已删除，回 done 而非 failed
-	if _, ok := e.store.GetUser(uuid); !ok {
-		return done(map[string]any{"uuid": uuid})
-	}
-	if err := e.store.DeleteUser(uuid); err != nil {
-		return failed(ErrInternal, err.Error())
-	}
-	return done(map[string]any{"uuid": uuid})
-}
-
-func (e *Executor) resetTraffic(cmd Command) CommandAck {
-	uuid, _ := cmd.Payload["uuid"].(string)
-	if uuid == "" {
-		return failed(ErrInvalidPayload, "uuid 必填")
-	}
-	if err := e.store.ResetTraffic(uuid); err != nil {
-		return failed(ErrUserNotFound, err.Error())
-	}
-	return done(map[string]any{"uuid": uuid})
-}
 
 func (e *Executor) getConfig() CommandAck {
 	return done(map[string]any{
@@ -255,7 +137,13 @@ func (e *Executor) doReload() CommandAck {
 }
 
 // EnableTunnel 开启 open_tunnel 支持。
-func (e *Executor) EnableTunnel(t TunnelOpener) { e.tunnel = t }
+//
+// allowedHost 是 --api-url 的主机名:隧道只允许连回同一台后端。
+// 否则后端(或冒充后端下指令的人)能让 agent 把 SSH 服务端接到任意地址上。
+func (e *Executor) EnableTunnel(t TunnelOpener, allowedHost string) {
+	e.tunnel = t
+	e.tunnelHost = allowedHost
+}
 
 type openTunnelPayload struct {
 	SessionID string    `json:"session_id"`
@@ -279,6 +167,9 @@ func (e *Executor) openTunnel(cmd Command) CommandAck {
 	}
 	if p.SessionID == "" || p.TunnelURL == "" {
 		return failed(ErrInvalidPayload, "session_id 与 tunnel_url 必填")
+	}
+	if !sameHost(p.TunnelURL, e.tunnelHost) {
+		return failed(ErrInvalidPayload, "tunnel_url 必须与 api-url 同主机")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -322,6 +213,13 @@ func (e *Executor) upgradeAgent(cmd Command) CommandAck {
 	// 已是目标版本：幂等，不重复下载（契约 §6.4）
 	if plan.ReleaseTag == e.agentVersion {
 		return done(map[string]any{"from": e.agentVersion, "to": plan.ReleaseTag})
+	}
+
+	// 只升不降,且只认语义化版本(拒绝 latest 这类浮动名)。
+	// 可降级 = 能把机器退回到一个有已知漏洞的版本(09 §5.3)。
+	if !isNewerRelease(plan.ReleaseTag, e.agentVersion) {
+		return failed(ErrInvalidPayload,
+			fmt.Sprintf("拒绝升级到 %q：目标必须是高于当前 %s 的语义化版本", plan.ReleaseTag, e.agentVersion))
 	}
 
 	if err := PrepareUpgrade(plan, e.upgrade.Repo, e.upgrade.ExePath); err != nil {

@@ -12,8 +12,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"otun-node-agent/internal/local"
 )
 
 type fakeStats struct{ m map[string]UserStat }
@@ -27,14 +25,13 @@ func (f fakeStore) UserCount() int { return f.n }
 func newRunner(t *testing.T, srv *httptest.Server) *Runner {
 	t.Helper()
 	dir := t.TempDir()
-	store := local.NewStore(dir, nil)
 	return &Runner{
 		DataDir:        dir,
 		APIURL:         srv.URL,
 		AgentVersion:   "v1.11.0",
 		Token:          "obx1_test",
 		Client:         NewClient(srv.URL, "v1.11.0"),
-		Executor:       NewExecutor(store, fakeInfo{}, "v1.11.0", func() error { return nil }),
+		Executor:       NewExecutor(fakeInfo{}, "v1.11.0", func() error { return nil }),
 		Info:           fakeInfo{},
 		Stats:          fakeStats{m: map[string]UserStat{}},
 		Store:          fakeStore{},

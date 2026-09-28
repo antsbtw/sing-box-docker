@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -874,8 +875,19 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		exePath = ""
 	}
 
-	executor := enroll.NewExecutor(a.localStore, info, Version, a.reloadForCommand)
-	if exePath != "" {
+	executor := enroll.NewExecutor(info, Version, a.reloadForCommand)
+
+	// 自升级只在托管模式开(09 §5.3、Q-4)。
+	//
+	// 自建 / 云 API 机器是用户的:能被后端推升级的 agent,可以绕过其余一切约束。
+	// 这类机器的升级由用户在 App 里确认、经 SSH 执行。
+	// 后端被攻破时照样能排队 upgrade_agent,所以必须 agent 自己拒收,不能只靠后端不发。
+	switch {
+	case !isHostedMode():
+		log.Println("[upgrade] 非托管模式：拒收 upgrade_agent，升级由用户在 App 里确认")
+	case exePath == "":
+		// 已在上面记过原因
+	default:
 		executor.EnableUpgrade(&enroll.UpgradeConfig{
 			Repo:    "antsbtw/sing-box-docker",
 			ExePath: exePath,
@@ -921,7 +933,7 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 
 		a.sshServer = srv
 		a.tunnelMgr = tunnel.NewManager(nodeID, nodeSecret, srv, 3)
-		executor.EnableTunnel(a.tunnelMgr)
+		executor.EnableTunnel(a.tunnelMgr, apiHost(a.cfg.APIURL))
 		return nil
 	}
 
@@ -1038,4 +1050,19 @@ func (a *Agent) singboxVersion() string {
 		return fields[2]
 	}
 	return "unknown"
+}
+
+// isHostedMode 报告本机是否是 OBox 托管机(install.sh --hosted 写入 OBOX_HOSTED=true)。
+func isHostedMode() bool {
+	return os.Getenv("OBOX_HOSTED") == "true"
+}
+
+// apiHost 取 --api-url 的主机名,供 open_tunnel 校验。解析不了返回空 ——
+// 空主机会让所有隧道请求被拒,宁可开不了终端也不连到别处。
+func apiHost(apiURL string) string {
+	u, err := url.Parse(apiURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }

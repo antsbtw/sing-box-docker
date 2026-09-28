@@ -110,14 +110,10 @@ type CommandAck struct {
 
 // 指令类型（契约 §6.2）
 const (
-	CmdCreateUser       = "create_user"
-	CmdUpdateUser       = "update_user"
-	CmdDeleteUser       = "delete_user"
-	CmdResetUserTraffic = "reset_user_traffic"
-	CmdGetConfig        = "get_config"
-	CmdReload           = "reload"
-	CmdPing             = "ping"
-	CmdUpgradeAgent     = "upgrade_agent"
+	CmdGetConfig    = "get_config"
+	CmdReload       = "reload"
+	CmdPing         = "ping"
+	CmdUpgradeAgent = "upgrade_agent"
 	// tunnel v1 §2.1：后端要求 agent 开一条隧道
 	CmdOpenTunnel = "open_tunnel"
 )
