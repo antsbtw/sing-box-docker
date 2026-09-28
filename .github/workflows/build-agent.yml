@@ -1,11 +1,26 @@
 name: Build Agent
 
+# 两件事,都不产生新的发布件:
+#
+# 1. build:push 到 main 时编译一遍,只作 CI 检查。
+# 2. update-latest:把**最新语义化版本 release** 的 agent 资产原样复制到 tag 名为
+#    `latest` 的 release,并按该版本的 SHA256SUMS 校验。
+#
+# ⚠️ `latest` 只为老版本 App 兼容而存在 —— 它们写死了
+# `releases/download/latest/agent-linux-*`。新代码一律按 tag 下载。
+#
+# ⚠️ 这里曾在 push main 时**从 main 重新构建**并上传到 `latest`。那样 `latest`
+# 就是一个字节与任何正式版本都不同、无法按校验和核对的版本;而 main 一度落后于
+# 正式版本,老 App 装出来的 agent 默认 SNI 是 www.microsoft.com、没有隧道
+# (2026-09-27 AWS 机器 VLESS 连不上的根源)。发布件只由 release.yml 按 tag 产出。
+#
+# 原来的 release 任务(release 创建时再编译一份上传)一并删除:
+# 它会往正式 release 里塞一份与该 release 的 SHA256SUMS 不符的二进制。
+
 on:
   push:
     branches:
       - main
-  release:
-    types: [created]
   workflow_dispatch:
 
 permissions:
@@ -31,74 +46,33 @@ jobs:
         with:
           go-version: '1.23'
 
-      - name: Build agent
+      - name: Build agent (CI check only)
         run: |
           CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
-            go build -ldflags "-s -w" \
-            -o agent-${{ matrix.goos }}-${{ matrix.goarch }} \
-            ./cmd/agent
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: agent-${{ matrix.goos }}-${{ matrix.goarch }}
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Prepare release files
-        run: |
-          mkdir -p release
-          find artifacts -type f -name 'agent-*' -exec mv {} release/ \;
-          chmod +x release/*
-          ls -la release/
-
-      - name: Upload to Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: release/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            go build -ldflags "-s -w" -o /dev/null ./cmd/agent
 
   update-latest:
-    needs: build
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
 
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Prepare release files
-        run: |
-          mkdir -p release
-          find artifacts -type f -name 'agent-*' -exec mv {} release/ \;
-          chmod +x release/*
-          ls -la release/
-
-      - name: Update latest release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: latest
-          name: Latest Build
-          body: |
-            Latest pre-built binaries from main branch.
-
-            Updated: ${{ github.event.head_commit.timestamp }}
-            Commit: ${{ github.sha }}
-          files: release/*
-          draft: false
-          prerelease: true
+      - name: Mirror newest release assets to `latest`
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG=$(gh release list -R "$REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
+                  --json tagName -q '.[].tagName' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "$TAG" ]; then echo "没有语义化版本的 release"; exit 1; fi
+          echo "镜像 $TAG → latest"
+
+          mkdir dl
+          gh release download "$TAG" -R "$REPO" -D dl -p 'agent-linux-*' -p SHA256SUMS
+          # 校验不过就不覆盖 —— 宁可 latest 停在旧版本,也不放一个核对不了的
+          (cd dl && grep -E ' agent-linux-(amd64|arm64)$' SHA256SUMS | sha256sum -c -)
+
+          gh release upload latest -R "$REPO" --clobber dl/agent-linux-amd64 dl/agent-linux-arm64
+          gh release edit latest -R "$REPO" --prerelease \
+            --notes "老版本 App 兼容地址。内容为 ${TAG} 的 agent 资产原样复制，校验和见 ${TAG} 的 SHA256SUMS。新代码请按 tag 下载。"
