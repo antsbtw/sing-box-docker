@@ -4,7 +4,12 @@ package tunnel
 //
 // 为什么不用系统 sshd：用它就要有系统账号的凭据，等于把"用户必须知道
 // SSH 密码"这个门槛又加回来 —— 整个隧道方案就失去意义了。
-// 内置服务端用后端签发的短期凭据认证，用户全程无感。
+//
+// 认证只有一种：设备持钥（owner key）。授权列表只在本机，后端既签不出
+// 也拿不到用户的私钥 —— 后端即使被完全攻破也进不去这台机器。
+//
+// v1.14.0 删除了「后端签发一次性密码凭据」那条认证分支（owner key 设计 §7）：
+// 它正是「后端被攻破即可进入任何机器」的来源。后端 09-23 起已停止签发。
 
 import (
 	"crypto/ed25519"
@@ -38,18 +43,8 @@ const hostKeySeedContext = "obox-host-key-v1|"
 
 // Server 是跑在隧道上的 SSH 服务端。
 type Server struct {
-	nodeID   string
-	verifier *CredVerifier
-	hostKey  ssh.Signer
-
-	// 后端公钥与 kid，随 poll 响应更新（契约 §3.3）
-	mu     sync.RWMutex
-	pubkey ed25519.PublicKey
-	keyID  string
-
-	// ServerTime 返回当前时间的权威值，来自最近一次 poll 的 server_time。
-	// 不信本机时钟：VPS 时钟漂移会让合法凭据被拒或过期凭据被放行。
-	ServerTime func() time.Time
+	nodeID  string
+	hostKey ssh.Signer
 
 	// authKeys 是设备持钥（owner key）的授权列表。
 	// 非 nil 时启用 publickey 认证 —— 裁决权在本机，后端签不出钥匙。
@@ -81,7 +76,7 @@ const hostKeySeedFileName = "host_key_seed"
 // install.sh 的清理不碰它。
 //
 // dataDir 为空时退回 node_secret 派生（仅用于测试，生产必传）。
-func NewServer(nodeID, nodeSecret, dataDir string, verifier *CredVerifier) (*Server, error) {
+func NewServer(nodeID, nodeSecret, dataDir string) (*Server, error) {
 	seed, err := loadOrCreateHostKeySeed(dataDir, nodeSecret)
 	if err != nil {
 		return nil, err
@@ -94,10 +89,8 @@ func NewServer(nodeID, nodeSecret, dataDir string, verifier *CredVerifier) (*Ser
 	}
 
 	return &Server{
-		nodeID:     nodeID,
-		verifier:   verifier,
-		hostKey:    signer,
-		ServerTime: time.Now,
+		nodeID:  nodeID,
+		hostKey: signer,
 	}, nil
 }
 
@@ -146,30 +139,15 @@ func loadOrCreateHostKeySeed(dataDir, nodeSecret string) ([]byte, error) {
 	return seed, nil
 }
 
-// SetTunnelKey 更新后端的凭据签名公钥（契约 §3.3，随每次 poll 下发）。
-func (s *Server) SetTunnelKey(pubkey ed25519.PublicKey, keyID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pubkey, s.keyID = pubkey, keyID
-}
-
-func (s *Server) tunnelKey() (ed25519.PublicKey, string) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.pubkey, s.keyID
-}
-
 // Serve 在一条隧道连接上跑 SSH 服务端，直到连接结束。
 //
 // sessionID 用于把凭据绑定到本会话：A 会话的凭据不能拿到 B 会话用。
 func (s *Server) Serve(conn net.Conn, sessionID string) error {
-	pubkey, keyID := s.tunnelKey()
-
-	// 没有后端公钥不再是致命错误：owner key 方案下 password 认证会被
-	// 整条删掉，那时 tunnel_pubkey 本就不存在。只要有设备钥匙就能开。
-	// 两者都没有才是真的进不去。
-	if pubkey == nil && s.authKeys == nil {
-		return errors.New("既无后端 tunnel_pubkey 也无设备钥匙，无法认证")
+	// 没有设备钥匙列表 = 谁都进不去。不给任何退路 —— 退路就是后门。
+	if s.authKeys == nil {
+		// 连接要关掉 —— 只返回错误的话,对端会一直等握手
+		_ = conn.Close()
+		return errors.New("未启用设备钥匙，无法认证")
 	}
 
 	cfg := &ssh.ServerConfig{}
@@ -179,47 +157,21 @@ func (s *Server) Serve(conn net.Conn, sessionID string) error {
 	// 钥匙只存在用户设备上，后端既签不出也拿不到 ——
 	// 后端即使被完全攻破也进不去这台机器。
 	// 裁决依据是本机的 authorized_keys.json，不是任何远端下发的东西。
-	if s.authKeys != nil {
-		cfg.PublicKeyCallback = func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if c.User() != sshUsername {
-				return nil, errAuthFailed
-			}
-			k, ok := s.authKeys.Authorized(key)
-			if !ok {
-				// 只记指纹，不回具体原因 —— 免得帮攻击者逐项试探
-				log.Printf("[tunnel] 未授权的设备钥匙：%s", ssh.FingerprintSHA256(key))
-				return nil, errAuthFailed
-			}
-			log.Printf("[tunnel] 设备 %q 通过 publickey 认证（%s）", k.Name, k.FP)
-			// 把本会话的指纹传下去，obox-key 用它记 added_by（审计用，不是门槛）
-			return &ssh.Permissions{
-				Extensions: map[string]string{"owner-key-fp": k.FP},
-			}, nil
+	cfg.PublicKeyCallback = func(c ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+		if c.User() != sshUsername {
+			return nil, errAuthFailed
 		}
-	}
-
-	// ── password：后端签发的一次性凭据（v1，迁移期保留）──────────────
-	//
-	// owner key 方案（§7）要求最终删掉这条 —— 它正是「后端被攻破
-	// 即可进入任何机器」的来源。但现网节点还在用它，两边同时切
-	// 会让所有存量节点立刻开不了终端。
-	//
-	// TODO(owner-key §7)：App 发版、用户重装完成之后删除本分支。
-	if pubkey != nil {
-		cfg.PasswordCallback = func(c ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
-			if c.User() != sshUsername {
-				return nil, errAuthFailed
-			}
-			err := s.verifier.Verify(
-				string(password), pubkey, keyID, s.nodeID, sessionID, s.ServerTime())
-			if err != nil {
-				// ⚠️ 只记日志，不把原因回给客户端 ——
-				// 泄露"哪一条不过"会帮助攻击者逐项试探（契约 §3.2 末）
-				log.Printf("[tunnel] 凭据验证失败: %v", err)
-				return nil, errAuthFailed
-			}
-			return nil, nil
+		k, ok := s.authKeys.Authorized(key)
+		if !ok {
+			// 只记指纹，不回具体原因 —— 免得帮攻击者逐项试探
+			log.Printf("[tunnel] 未授权的设备钥匙：%s", ssh.FingerprintSHA256(key))
+			return nil, errAuthFailed
 		}
+		log.Printf("[tunnel] 设备 %q 通过 publickey 认证（%s）", k.Name, k.FP)
+		// 把本会话的指纹传下去，obox-key 用它记 added_by（审计用，不是门槛）
+		return &ssh.Permissions{
+			Extensions: map[string]string{"owner-key-fp": k.FP},
+		}, nil
 	}
 
 	cfg.AddHostKey(s.hostKey)
@@ -553,23 +505,32 @@ func (s *Server) runExec(ch ssh.Channel, command string, p *ptyRequest) {
 	cmd.Dir = homeDir()
 
 	if p == nil {
-		// ⚠️ 不能写 cmd.Stdin = ch。
+		// stdin 经管道转给命令 —— 配方的密参从 stdin 读(应用平台 09 §4.2)。
 		//
-		// 那样 cmd.Run() 会等 stdin 到 EOF —— 而 SSH channel 只有在
-		// 客户端主动半关闭时才 EOF。很多客户端（包括本 App 的
-		// executeCommand）发完 exec 请求就等结果、不关写端，
-		// 于是命令跑完了 cmd.Run() 仍卡在复制 stdin 上，
-		// 两边对着等，channel 永不关闭（2026-09-23 真机实测：
-		// `id -u` 卡死，客户端日志停在「子通道已建立，等待关闭」）。
+		// ⚠️ 不能写 cmd.Stdin = ch。那样 cmd.Run() 会等 stdin 到 EOF,
+		// 而很多客户端发完 exec 就等结果、从不半关闭写端,于是命令跑完了
+		// cmd.Run() 仍卡在复制 stdin 上,channel 永不关闭
+		// (2026-09-23 真机实测:`id -u` 卡死)。
 		//
-		// 非交互命令本来也不需要从 channel 读输入：要交互就该用 pty。
-		// 所以这里把 stdin 接到空。
-		cmd.Stdin = nil
+		// 用 StdinPipe:复制在独立 goroutine 里做,cmd.Wait() 只等进程退出、
+		// 退出时关掉管道,不等客户端的 EOF。不发输入的客户端照旧,
+		// 发输入并半关闭的客户端(App 执行配方)命令能读到。
 		cmd.Stdout = ch
 		cmd.Stderr = ch.Stderr()
 
 		code := 0
-		if err := cmd.Run(); err != nil {
+		stdin, err := cmd.StdinPipe()
+		if err == nil {
+			err = cmd.Start()
+		}
+		if err == nil {
+			go func() {
+				_, _ = io.Copy(stdin, ch)
+				_ = stdin.Close()
+			}()
+			err = cmd.Wait()
+		}
+		if err != nil {
 			var ee *exec.ExitError
 			if errors.As(err, &ee) {
 				code = ee.ExitCode()

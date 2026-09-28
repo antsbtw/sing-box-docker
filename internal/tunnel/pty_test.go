@@ -40,8 +40,8 @@ func readUntil(t *testing.T, stdout io.Reader, d time.Duration) string {
 
 // A-4/A-6：pty-req 的 TERM 与初始窗口尺寸必须传给 shell。
 func TestPTYEnvAndWinsize(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "pty1"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,8 +76,8 @@ func TestPTYEnvAndWinsize(t *testing.T) {
 
 // A-6：shell 启动之后到达的 window-change 必须生效（旋屏、键盘弹出）。
 func TestWindowChangeAfterShellStart(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "pty2"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,8 +168,8 @@ func TestShellEnvDropsSecrets(t *testing.T) {
 // T-1：shell 退出后必须回 exit-status 并关闭 channel，
 // 否则 App 的终端页面会一直挂着，用户看不到「会话已结束」。
 func TestShellExitClosesSession(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exit1"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,8 +215,8 @@ func TestShellExitClosesSession(t *testing.T) {
 // T-2：pty-req 之后的 exec 要跑在 pty 上（ssh -t host cmd 形态）。
 // top、apt 进度条这类命令经 exec 启动时需要（A-4/A-5）。
 func TestExecOnPTY(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exec1"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -252,8 +252,8 @@ func TestExecOnPTY(t *testing.T) {
 
 // 没有 pty-req 的 exec 保持原样：不分配 pty（安装脚本走这条）。
 func TestExecWithoutPTYStaysNonInteractive(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exec2"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,8 +276,8 @@ func TestExecWithoutPTYStaysNonInteractive(t *testing.T) {
 
 // exec 的退出码要回传（安装脚本据此判断成败）。
 func TestExecExitStatus(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "exec3"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,8 +309,8 @@ func TestExecExitStatus(t *testing.T) {
 // 已有的 TestExecExitStatus 用 sess.Run()，x/crypto/ssh 会替你关写端，
 // 所以一直是绿的 —— 覆盖不到这个场景。
 func TestExecCompletesWithoutClosingStdin(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "noclose"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,8 +391,8 @@ func TestDirectTCPIPForwardsToLoopback(t *testing.T) {
 	}()
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "fwd1"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,8 +444,8 @@ func TestDirectTCPIPRejectsNonLoopback(t *testing.T) {
 	}()
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "fwd2"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}

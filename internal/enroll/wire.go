@@ -40,11 +40,6 @@ type RegisterResponse struct {
 	PollMaxWaitS       int       `json:"poll_max_wait_s"`
 	ServerTime         time.Time `json:"server_time"`
 	Reenrolled         bool      `json:"reenrolled"`
-
-	// 隧道凭据的签名公钥（tunnel v1 §3.3）。注册与轮询响应都会下发，
-	// 已接入的旧 agent 从下一次 poll 即可拿到，无需重注册。
-	TunnelPubkey string `json:"tunnel_pubkey,omitempty"`
-	TunnelKeyID  string `json:"tunnel_key_id,omitempty"`
 }
 
 // ── 长轮询 §5 ──────────────────────────────────────────────
@@ -93,10 +88,6 @@ type PollResponse struct {
 	Commands   []Command `json:"commands"`
 	Acked      []string  `json:"acked"`
 	NextWaitS  int       `json:"next_wait_s"`
-
-	// 隧道签名公钥。key_id 变化时 agent 应覆盖本地缓存（tunnel v1 §3.3）。
-	TunnelPubkey string `json:"tunnel_pubkey,omitempty"`
-	TunnelKeyID  string `json:"tunnel_key_id,omitempty"`
 }
 
 // ── 指令 §6 ────────────────────────────────────────────────

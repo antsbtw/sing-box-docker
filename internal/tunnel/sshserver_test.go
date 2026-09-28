@@ -1,9 +1,7 @@
 package tunnel
 
 import (
-	"crypto/ed25519"
-	"encoding/base64"
-	"encoding/json"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -15,72 +13,123 @@ import (
 )
 
 // 端到端：用真实的 SSH 客户端连内置服务端，验证认证与 exec。
-func newServerPair(t *testing.T) (*Server, ed25519.PrivateKey, string, string) {
+//
+// 返回的 signer 是一台已授权设备的钥匙 —— 认证只有设备持钥这一种。
+func newServerPair(t *testing.T) (*Server, ssh.Signer, string, string) {
 	t.Helper()
-	pub, priv, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
 	const nodeID, sessionID = "byo-test01", "sess-abc"
 
-	srv, err := NewServer(nodeID, "node-secret-xyz", t.TempDir(), NewCredVerifier())
+	srv, err := NewServer(nodeID, "node-secret-xyz", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv.SetTunnelKey(pub, KeyIDFor(pub))
-	return srv, priv, nodeID, sessionID
-}
-
-func credFor(t *testing.T, priv ed25519.PrivateKey, nodeID, sessionID, nonce string) string {
-	t.Helper()
-	pub := priv.Public().(ed25519.PublicKey)
-	now := time.Now()
-	p := CredPayload{
-		V: 1, KID: KeyIDFor(pub), NodeID: nodeID, SessionID: sessionID,
-		IAT: now.Unix(), EXP: now.Add(5 * time.Minute).Unix(), Nonce: nonce,
+	store := NewAuthKeyStore(t.TempDir())
+	line, _, signer := makeDeviceKey(t, "test-device")
+	if _, err := store.Reset(line, "test"); err != nil {
+		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(p)
-	mid := base64.RawURLEncoding.EncodeToString(raw)
-	sig := ed25519.Sign(priv, []byte(sigContext+mid))
-	return credPrefix + "." + mid + "." + base64.RawURLEncoding.EncodeToString(sig)
+	srv.EnableOwnerKeys(store)
+	return srv, signer, nodeID, sessionID
 }
 
 // dial 在本地 TCP 环回上跑服务端，返回已连接的 SSH 客户端。
 //
 // ⚠️ 不能用 net.Pipe：它是**无缓冲**的同步管道，SSH 握手双方
 // 同时写入时会互相阻塞，测试直接挂死。
-func dial(t *testing.T, srv *Server, sessionID, password string) (*ssh.Client, error) {
+func dial(t *testing.T, srv *Server, sessionID string, signer ssh.Signer) (*ssh.Client, error) {
 	t.Helper()
-	c2 := serveOnLoopback(t, srv, sessionID)
+	return dialWithKey(t, srv, sessionID, signer)
+}
 
+// v1.14.0:密码认证分支已删除。任何密码 —— 包括曾经合法格式的后端凭据 —— 一律被拒。
+//
+// 这条是「后端被攻破也进不去用户的机器」的回归测试。
+func TestSSHServerRejectsAnyPassword(t *testing.T) {
+	srv, _, _, sessionID := newServerPair(t)
+	c2 := serveOnLoopback(t, srv, sessionID)
 	cfg := &ssh.ClientConfig{
 		User:            sshUsername,
-		Auth:            []ssh.AuthMethod{ssh.Password(password)},
+		Auth:            []ssh.AuthMethod{ssh.Password("obt1.payload.signature")},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         5 * time.Second,
 	}
-	conn, chans, reqs, err := ssh.NewClientConn(c2, "tunnel", cfg)
-	if err != nil {
-		return nil, err
+	if _, _, _, err := ssh.NewClientConn(c2, "tunnel", cfg); err == nil {
+		t.Fatal("密码认证必须一律被拒")
 	}
-	return ssh.NewClient(conn, chans, reqs), nil
 }
 
-func TestSSHServerAcceptsValidCredential(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	cred := credFor(t, priv, nodeID, sessionID, "n1")
-
-	client, err := dial(t, srv, sessionID, cred)
+// 没有启用设备钥匙列表时,连接直接失败 —— 不存在任何退路。
+func TestSSHServerWithoutOwnerKeysRefuses(t *testing.T) {
+	srv, err := NewServer("n", "s", t.TempDir())
 	if err != nil {
-		t.Fatalf("合法凭据应能登录：%v", err)
+		t.Fatal(err)
+	}
+	_, _, signer := makeDeviceKey(t, "x")
+	if _, err := dial(t, srv, "sess", signer); err == nil {
+		t.Fatal("未启用设备钥匙时不应能登录")
+	}
+}
+
+// A-10:exec 的 stdin 能送到命令 —— 配方的密参经 stdin 传入。
+func TestSSHServerExecReceivesStdin(t *testing.T) {
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
+	if err != nil {
+		t.Fatal(err)
 	}
 	defer client.Close()
+
+	sess, _ := client.NewSession()
+	defer sess.Close()
+	sess.Stdin = strings.NewReader(`{"auth_key":"k"}`)
+	out, err := sess.Output("cat")
+	if err != nil {
+		t.Fatalf("exec 失败：%v", err)
+	}
+	if string(out) != `{"auth_key":"k"}` {
+		t.Errorf("stdin 未送达，输出 = %q", out)
+	}
+}
+
+// 不发 stdin、也不半关闭的客户端不能卡住(2026-09-23 的 `id -u` 卡死)。
+func TestSSHServerExecWithoutStdinDoesNotHang(t *testing.T) {
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ch, reqs, err := client.OpenChannel("session", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go ssh.DiscardRequests(reqs)
+	payload := ssh.Marshal(struct{ Command string }{"echo done"})
+	if ok, err := ch.SendRequest("exec", true, payload); err != nil || !ok {
+		t.Fatalf("exec 请求失败：%v", err)
+	}
+	// 故意不 CloseWrite
+
+	done := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(ch)
+		done <- b
+	}()
+	select {
+	case b := <-done:
+		if strings.TrimSpace(string(b)) != "done" {
+			t.Errorf("输出 = %q", b)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("未半关闭 stdin 的客户端卡住了")
+	}
 }
 
 // A-5：exec 能执行任意命令 —— 这是"装任何软件"的基础。
 func TestSSHServerExec(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "n2"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatalf("登录失败：%v", err)
 	}
@@ -103,8 +152,8 @@ func TestSSHServerExec(t *testing.T) {
 
 // exec 的退出码要能正确回传 —— 安装脚本靠它判断成败。
 func TestSSHServerExecExitCode(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	client, err := dial(t, srv, sessionID, credFor(t, priv, nodeID, sessionID, "n3"))
+	srv, signer, _, sessionID := newServerPair(t)
+	client, err := dial(t, srv, sessionID, signer)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,23 +180,15 @@ func asExitError(err error, target **ssh.ExitError) bool {
 	return false
 }
 
-func TestSSHServerRejectsBadCredential(t *testing.T) {
-	srv, _, _, sessionID := newServerPair(t)
-	if _, err := dial(t, srv, sessionID, "obt1.garbage.sig"); err == nil {
-		t.Error("无效凭据应被拒")
-	}
-}
-
 // 契约 §2.3：用户名固定 obox，其他一律拒。
 func TestSSHServerRejectsWrongUsername(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	cred := credFor(t, priv, nodeID, sessionID, "n4")
+	srv, signer, _, sessionID := newServerPair(t)
 
 	c2 := serveOnLoopback(t, srv, sessionID)
 
 	cfg := &ssh.ClientConfig{
 		User:            "root", // 不是 obox
-		Auth:            []ssh.AuthMethod{ssh.Password(cred)},
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Timeout:         5 * time.Second,
 	}
@@ -164,11 +205,11 @@ func fpOf(t *testing.T, s *Server) string {
 // A-2：同一台机器重启，指纹必须不变。
 func TestHostKeyStableAcrossRestarts(t *testing.T) {
 	dir := t.TempDir()
-	s1, err := NewServer("n", "secret-a", dir, NewCredVerifier())
+	s1, err := NewServer("n", "secret-a", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, _ := NewServer("n", "secret-a", dir, NewCredVerifier())
+	s2, _ := NewServer("n", "secret-a", dir)
 
 	if fpOf(t, s1) != fpOf(t, s2) {
 		t.Error("同一台机器重启后指纹必须一致")
@@ -184,12 +225,12 @@ func TestHostKeyStableAcrossRestarts(t *testing.T) {
 // 用户会习惯性点"信任"，真有人冒充时也照点不误。
 func TestHostKeySurvivesSecretRotation(t *testing.T) {
 	dir := t.TempDir()
-	before, err := NewServer("n", "secret-before-reinstall", dir, NewCredVerifier())
+	before, err := NewServer("n", "secret-before-reinstall", dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// 重装：node_secret 换了，data/ 里的种子还在
-	after, _ := NewServer("n", "secret-AFTER-reinstall", dir, NewCredVerifier())
+	after, _ := NewServer("n", "secret-AFTER-reinstall", dir)
 
 	if fpOf(t, before) != fpOf(t, after) {
 		t.Error("后端轮换 node_secret 不该改变指纹 —— 否则每次重装都告警，" +
@@ -199,11 +240,11 @@ func TestHostKeySurvivesSecretRotation(t *testing.T) {
 
 // 换机器（或 data/ 被清空）指纹必须变 —— 那才是真信号。
 func TestHostKeyChangesOnNewMachine(t *testing.T) {
-	a, err := NewServer("n", "same-secret", t.TempDir(), NewCredVerifier())
+	a, err := NewServer("n", "same-secret", t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, _ := NewServer("n", "same-secret", t.TempDir(), NewCredVerifier())
+	b, _ := NewServer("n", "same-secret", t.TempDir())
 
 	if fpOf(t, a) == fpOf(t, b) {
 		t.Error("不同机器应有不同指纹 —— 否则 pin 分辨不出冒充")
@@ -213,7 +254,7 @@ func TestHostKeyChangesOnNewMachine(t *testing.T) {
 // 种子文件权限必须是 0600：拿到它就能冒充这台机器。
 func TestHostKeySeedPermissions(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := NewServer("n", "s", dir, NewCredVerifier()); err != nil {
+	if _, err := NewServer("n", "s", dir); err != nil {
 		t.Fatal(err)
 	}
 
@@ -231,7 +272,7 @@ func TestHostKeySeedPermissions(t *testing.T) {
 // 指纹变化只需用户确认一次；起不来则整台机器失联 —— 两害相权取其轻。
 func TestCorruptSeedRegenerates(t *testing.T) {
 	dir := t.TempDir()
-	if _, err := NewServer("n", "s", dir, NewCredVerifier()); err != nil {
+	if _, err := NewServer("n", "s", dir); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, hostKeySeedFileName)
@@ -239,28 +280,12 @@ func TestCorruptSeedRegenerates(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	srv, err := NewServer("n", "s", dir, NewCredVerifier())
+	srv, err := NewServer("n", "s", dir)
 	if err != nil {
 		t.Fatalf("种子损坏不该让 agent 起不来：%v", err)
 	}
 	if srv.hostKey == nil {
 		t.Error("应重新生成可用的主机密钥")
-	}
-}
-
-// 凭据一次性：同一条不能用两次（S-2）。
-func TestSSHServerRejectsReplayedCredential(t *testing.T) {
-	srv, priv, nodeID, sessionID := newServerPair(t)
-	cred := credFor(t, priv, nodeID, sessionID, "n5")
-
-	c, err := dial(t, srv, sessionID, cred)
-	if err != nil {
-		t.Fatalf("首次应成功：%v", err)
-	}
-	c.Close()
-
-	if _, err := dial(t, srv, sessionID, cred); err == nil {
-		t.Error("同一凭据第二次应被拒")
 	}
 }
 

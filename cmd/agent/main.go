@@ -909,12 +909,10 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 	var setupTunnel func(nodeID, nodeSecret string) error
 	setupTunnel = func(nodeID, nodeSecret string) error {
 		// dataDir 传进去：主机密钥从本机种子派生，重装不换指纹
-		srv, err := tunnel.NewServer(nodeID, nodeSecret, dataDir, tunnel.NewCredVerifier())
+		srv, err := tunnel.NewServer(nodeID, nodeSecret, dataDir)
 		if err != nil {
 			return err
 		}
-		// 凭据有效期以**后端时间**判定，不信本机时钟（契约 §3.2 第 4 条）
-		srv.ServerTime = time.Now
 
 		// 设备持钥认证（owner key §3.2）：授权与否只看本机这份列表。
 		// 列表为空 = 谁都进不去 —— 无 --owner-key 装出来的节点就是这样，
@@ -927,29 +925,16 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		return nil
 	}
 
-	applyTunnelKey := func(pubkeyB64, keyID string) {
-		if a.sshServer == nil {
-			return
-		}
-		pub, err := tunnel.ParsePubkey(pubkeyB64)
-		if err != nil {
-			log.Printf("[tunnel] 后端公钥无法解析：%v", err)
-			return
-		}
-		a.sshServer.SetTunnelKey(pub, keyID)
-		log.Printf("[tunnel] 已更新隧道签名公钥 (kid=%s)", keyID)
-	}
-
-	// 已接入的节点：先用 node.json 里缓存的公钥建起来，
-	// 不必等第一次 poll —— 否则刚重启就开终端会被拒。
+	// 已接入的节点：先把隧道建起来，不必等第一次 poll ——
+	// 否则刚重启就开终端会被拒。
+	//
+	// v1.14.0 起不再接收后端的隧道签名公钥（密码认证分支已删除），
+	// 认证只看本机的设备钥匙列表。
 	if existing != nil {
 		if err := setupTunnel(existing.NodeID, existing.NodeSecret); err != nil {
 			log.Printf("[tunnel] 初始化失败：%v", err)
-		} else if existing.TunnelPubkey != "" {
-			applyTunnelKey(existing.TunnelPubkey, existing.TunnelKeyID)
 		}
 	}
-	runner.OnTunnelKey = applyTunnelKey
 
 	if err := runner.Prepare(ctx); err != nil {
 		// 注册终态（token 已废、版本过低）：不能让进程继续以普通 local 模式
@@ -968,8 +953,6 @@ func (a *Agent) startEnrollment(ctx context.Context) error {
 		if nf, err := enroll.LoadNodeFile(dataDir); err == nil && nf != nil {
 			if err := setupTunnel(nf.NodeID, nf.NodeSecret); err != nil {
 				log.Printf("[tunnel] 初始化失败：%v", err)
-			} else if nf.TunnelPubkey != "" {
-				applyTunnelKey(nf.TunnelPubkey, nf.TunnelKeyID)
 			}
 		}
 	}
