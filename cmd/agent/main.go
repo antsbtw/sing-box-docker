@@ -259,17 +259,44 @@ func (a *Agent) Run(ctx context.Context) {
 		a.initHybridMode()
 	}
 
-	// 启动 sing-box
-	if os.Getenv("SKIP_SINGBOX") != "true" {
+	// 启动 sing-box。
+	//
+	// ⚠️ 判据是「装没装」（二进制与配置都在），**不是**启动时的 SKIP_SINGBOX。
+	//
+	// token 接入时 unit 里写的是 SKIP_SINGBOX=true（那时还没装 sing-box）。之后用户
+	// 从 App 经隧道装上 sing-box，App 会重启 agent「让它重新判断」—— 但原来这里只认
+	// 那个变量，重启后依旧跳过：agent 不接管 sing-box，心跳报 singbox_running=false，
+	// 后端回 service_not_running，App 一直显示「未就绪」（1.4.0 回归 I3）。
+	// /health 与 reload 两处早已按二进制判断，这里与它们一致。
+	if a.shouldStartSingbox() {
 		if err := a.manager.Start(); err != nil {
 			log.Printf("Failed to start sing-box: %v", err)
 		}
 	} else {
-		log.Println("SKIP_SINGBOX=true, skipping sing-box start")
+		log.Println("sing-box 未安装，跳过启动")
 	}
 
 	// 启动主循环
 	a.runMainLoop(ctx)
+}
+
+// shouldStartSingbox 报告启动时要不要拉起 sing-box：二进制与配置都在就拉。
+//
+// SKIP_SINGBOX 只在「确实没装」时有意义；装上之后它就是一个过期的值
+// （unit 里的环境变量不会随安装更新）。
+func (a *Agent) shouldStartSingbox() bool {
+	return singboxInstalled(a.cfg.SingboxBin, a.cfg.SingboxConfig)
+}
+
+// singboxInstalled 二进制与配置文件都存在。
+func singboxInstalled(bin, config string) bool {
+	if _, err := os.Stat(bin); err != nil {
+		return false
+	}
+	if _, err := os.Stat(config); err != nil {
+		return false
+	}
+	return true
 }
 
 // isTokenMode 报告本机是否走 Token 接入（外连模式）。
