@@ -25,11 +25,17 @@ permissions:
   contents: write
 
 env:
-  # sing-box 上游版本。
-  # ⚠️ 升级跨过 1.11.x 时必须去掉 with_reality_server —— 该标签自 1.12.0
-  # 起并入 with_utls，继续带着会编译失败。
-  SINGBOX_VERSION: '1.10.7'
-  SINGBOX_TAGS: 'with_v2ray_api,with_utls,with_reality_server'
+  # sing-box 上游版本 —— 官方最新稳定版（SagerNet releases，非 prerelease）。
+  # 2026-10-10：1.10.7 → 1.14.3。目的：用官方最新源码，并让 QUIC 系协议可用。
+  #
+  # ⚠️ 标签随版本演进，跨大版本升级时务必核对，否则编译失败：
+  #   - with_reality_server 自 1.12.0 起并入 with_utls，**已去掉**（再带会编译失败）。
+  #   - with_quic 是 Hysteria2 / TUIC / QUIC 传输的前提，**本次新增**；
+  #     不加则二进制里没有这两种协议，配置含它们时 sing-box 直接报
+  #     "QUIC is not included in this build"。
+  #   - with_v2ray_api 保留：流量统计/限额依赖它（新版虽默认内置，显式带着无害）。
+  SINGBOX_VERSION: '1.14.3'
+  SINGBOX_TAGS: 'with_v2ray_api,with_utls,with_quic'
 
 jobs:
   build:
