@@ -23,6 +23,10 @@ type AgentConfig struct {
 	StatsInterval  time.Duration
 	VLESSPort      int
 	SSPort         int
+	VMessPort      int // VMess（WS，无 TLS）
+	TrojanPort     int // Trojan（自签 TLS）
+	Hysteria2Port  int // Hysteria2（UDP/QUIC，自签 TLS）
+	TUICPort       int // TUIC（UDP/QUIC，自签 TLS）
 	SingboxBin     string
 	SingboxConfig  string
 	LogLevel       string

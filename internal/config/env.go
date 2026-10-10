@@ -22,6 +22,12 @@ func LoadFromEnv() *AgentConfig {
 		StatsInterval:  getDurationEnv("STATS_INTERVAL", 300) * time.Second,
 		VLESSPort:      getIntEnv("VLESS_PORT", 443),
 		SSPort:         getIntEnv("SS_PORT", 8388),
+		// 新增四协议端口。默认 0 = 不启用该协议（向后兼容：老节点不下发这些
+		// 环境变量时行为完全不变，仍只跑 VLESS+SS）。App 安装/升级时下发具体端口。
+		VMessPort:      getIntEnv("VMESS_PORT", 0),
+		TrojanPort:     getIntEnv("TROJAN_PORT", 0),
+		Hysteria2Port:  getIntEnv("HYSTERIA2_PORT", 0),
+		TUICPort:       getIntEnv("TUIC_PORT", 0),
 		SingboxBin:     getEnv("SINGBOX_BIN", "/usr/local/bin/sing-box"),
 		SingboxConfig:  getEnv("SINGBOX_CONFIG", "/etc/sing-box/config.json"),
 		LogLevel:       getEnv("LOG_LEVEL", "info"),

@@ -165,6 +165,32 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 	syncer := config.NewSyncer(cfg.APIURL, cfg.NodeAPIKey)
 	cache := config.NewCache(dataDir)
 	generator := config.NewGenerator(cfg.VLESSPort, ssPort, secrets.PrivateKey, secrets.ShortIDs)
+
+	// 自签证书（Trojan/Hysteria2/TUIC 用；方案 B：客户端 insecure）。
+	// 从节点私钥确定性派生，重启不变。任一新协议端口 > 0 时才需要。
+	var certPath, keyPath string
+	if cfg.TrojanPort > 0 || cfg.Hysteria2Port > 0 || cfg.TUICPort > 0 {
+		certs, err := config.EnsureSelfSignedCert(dataDir, secrets.PrivateKey)
+		if err != nil {
+			log.Printf("Warning: self-signed cert generation failed, TLS protocols disabled: %v", err)
+		} else {
+			certPath, keyPath = certs.CertPath, certs.KeyPath
+			log.Printf("Self-signed cert ready: %s", certPath)
+		}
+	}
+	generator.WithExtraProtocols(cfg.VMessPort, cfg.TrojanPort, cfg.Hysteria2Port, cfg.TUICPort, certPath, keyPath)
+	if cfg.VMessPort > 0 {
+		log.Printf("VMess Port: %d", cfg.VMessPort)
+	}
+	if cfg.TrojanPort > 0 {
+		log.Printf("Trojan Port: %d", cfg.TrojanPort)
+	}
+	if cfg.Hysteria2Port > 0 {
+		log.Printf("Hysteria2 Port: %d", cfg.Hysteria2Port)
+	}
+	if cfg.TUICPort > 0 {
+		log.Printf("TUIC Port: %d", cfg.TUICPort)
+	}
 	manager := singbox.NewManager(cfg.SingboxBin, cfg.SingboxConfig)
 	connMgr := singbox.NewConnectionManager(singboxAPIAddr)
 	collector := stats.NewCollector(singboxAPIAddr)
@@ -205,14 +231,18 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 
 		// 创建本地 API 服务
 		nodeConfig := &api.NodeConfig{
-			NodeID:     cfg.NodeID,
-			ServerIP:   cfg.ServerIP,
-			PublicKey:  secrets.PublicKey,
-			ShortID:    secrets.ShortIDs[0],
-			VLESSPort:  cfg.VLESSPort,
-			SSPort:     ssPort,
-			SSMethod:   "chacha20-ietf-poly1305",
-			RealitySNI: cfg.RealitySNI,
+			NodeID:        cfg.NodeID,
+			ServerIP:      cfg.ServerIP,
+			PublicKey:     secrets.PublicKey,
+			ShortID:       secrets.ShortIDs[0],
+			VLESSPort:     cfg.VLESSPort,
+			SSPort:        ssPort,
+			SSMethod:      "chacha20-ietf-poly1305",
+			RealitySNI:    cfg.RealitySNI,
+			VMessPort:     cfg.VMessPort,
+			TrojanPort:    cfg.TrojanPort,
+			Hysteria2Port: cfg.Hysteria2Port,
+			TUICPort:      cfg.TUICPort,
 		}
 		agent.localAPI = api.NewLocalAPIServer(agent.localStore, cfg.NodeAPIKey, nodeConfig)
 

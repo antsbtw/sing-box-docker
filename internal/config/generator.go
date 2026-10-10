@@ -12,8 +12,14 @@ import (
 type Generator struct {
 	vlessPort  int
 	ssPort     int
+	vmessPort  int
+	trojanPort int
+	hy2Port    int
+	tuicPort   int
 	privateKey string
 	shortIDs   []string
+	certPath   string // 自签证书（Trojan/Hy2/TUIC 用）
+	keyPath    string
 }
 
 // NewGenerator 创建配置生成器
@@ -26,6 +32,18 @@ func NewGenerator(vlessPort, ssPort int, privateKey string, shortIDs []string) *
 	}
 }
 
+// WithExtraProtocols 配置 VMess/Trojan/Hysteria2/TUIC 的端口与自签证书。
+// 返回 g 以便链式调用。任一端口为 0 时该协议不生成 inbound。
+func (g *Generator) WithExtraProtocols(vmessPort, trojanPort, hy2Port, tuicPort int, certPath, keyPath string) *Generator {
+	g.vmessPort = vmessPort
+	g.trojanPort = trojanPort
+	g.hy2Port = hy2Port
+	g.tuicPort = tuicPort
+	g.certPath = certPath
+	g.keyPath = keyPath
+	return g
+}
+
 // ssMasterPassword 生成 shadowsocks inbound 的 master key。
 //
 // chacha20-ietf-poly1305 要求 32 字节密钥的 base64。
@@ -36,10 +54,22 @@ func (g *Generator) ssMasterPassword() string {
 	return base64.StdEncoding.EncodeToString(sum[:])
 }
 
+// orEmpty 把 nil 切片转成空 JSON 数组（sing-box 需要 users 字段存在）。
+func orEmpty(u []map[string]any) []map[string]any {
+	if u == nil {
+		return []map[string]any{}
+	}
+	return u
+}
+
 // Generate 根据用户列表生成 sing-box 配置
 func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 	var vlessUsers []map[string]any
 	var ssUsers []map[string]any
+	var vmessUsers []map[string]any
+	var trojanUsers []map[string]any
+	var hy2Users []map[string]any
+	var tuicUsers []map[string]any
 	var statsUsers []string
 
 	for _, u := range users {
@@ -48,7 +78,7 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 		}
 
 		// 关键修复：无论用户使用哪些协议，都加入统计列表
-		// 这样可以确保 sing-box V2Ray API 统计该用户的所有流量（VLESS + Shadowsocks）
+		// 这样可以确保 sing-box V2Ray API 统计该用户的所有流量（全部协议）
 		// 从而实现跨协议的统一流量限制
 		statsUsers = append(statsUsers, u.UUID)
 
@@ -63,6 +93,28 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 				ssUsers = append(ssUsers, map[string]any{
 					"name":     u.UUID,
 					"password": u.SSPassword,
+				})
+			case "vmess":
+				vmessUsers = append(vmessUsers, map[string]any{
+					"name":    u.UUID,
+					"uuid":    VMessUUID(u.UUID),
+					"alterId": 0,
+				})
+			case "trojan":
+				trojanUsers = append(trojanUsers, map[string]any{
+					"name":     u.UUID,
+					"password": TrojanPassword(u.UUID),
+				})
+			case "hysteria2":
+				hy2Users = append(hy2Users, map[string]any{
+					"name":     u.UUID,
+					"password": Hysteria2Password(u.UUID),
+				})
+			case "tuic":
+				tuicUsers = append(tuicUsers, map[string]any{
+					"name":     u.UUID,
+					"uuid":     TUICUUID(u.UUID),
+					"password": TUICPassword(u.UUID),
 				})
 			}
 		}
@@ -135,6 +187,72 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 		ssInbound["users"] = []map[string]any{}
 	}
 	inbounds = append(inbounds, ssInbound)
+
+	// selfTLS 生成自签 TLS 块（Trojan/Hy2/TUIC 共用）。
+	selfTLS := func() map[string]any {
+		return map[string]any{
+			"enabled":          true,
+			"server_name":      SelfCertCN,
+			"certificate_path": g.certPath,
+			"key_path":         g.keyPath,
+		}
+	}
+
+	// VMess inbound（WS，无 TLS）—— 仅在配置了端口时创建。
+	if g.vmessPort > 0 {
+		vmessInbound := map[string]any{
+			"type":        "vmess",
+			"tag":         "vmess-in",
+			"listen":      "::",
+			"listen_port": g.vmessPort,
+			"transport": map[string]any{
+				"type": "ws",
+				"path": "/vmess",
+			},
+			"users": orEmpty(vmessUsers),
+		}
+		inbounds = append(inbounds, vmessInbound)
+	}
+
+	// 以下三种需要自签证书，证书路径为空时跳过（避免 sing-box 启动失败）。
+	hasCert := g.certPath != "" && g.keyPath != ""
+
+	// Trojan inbound（TCP + 自签 TLS）。
+	if g.trojanPort > 0 && hasCert {
+		inbounds = append(inbounds, map[string]any{
+			"type":        "trojan",
+			"tag":         "trojan-in",
+			"listen":      "::",
+			"listen_port": g.trojanPort,
+			"tls":         selfTLS(),
+			"users":       orEmpty(trojanUsers),
+		})
+	}
+
+	// Hysteria2 inbound（UDP/QUIC + 自签 TLS）。
+	if g.hy2Port > 0 && hasCert {
+		inbounds = append(inbounds, map[string]any{
+			"type":        "hysteria2",
+			"tag":         "hy2-in",
+			"listen":      "::",
+			"listen_port": g.hy2Port,
+			"tls":         selfTLS(),
+			"users":       orEmpty(hy2Users),
+		})
+	}
+
+	// TUIC inbound（UDP/QUIC + 自签 TLS）。
+	if g.tuicPort > 0 && hasCert {
+		inbounds = append(inbounds, map[string]any{
+			"type":                "tuic",
+			"tag":                 "tuic-in",
+			"listen":              "::",
+			"listen_port":         g.tuicPort,
+			"congestion_control":  "bbr",
+			"tls":                 selfTLS(),
+			"users":               orEmpty(tuicUsers),
+		})
+	}
 
 	config["inbounds"] = inbounds
 

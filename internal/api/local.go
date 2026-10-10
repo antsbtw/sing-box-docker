@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"otun-node-agent/internal/config"
 	"otun-node-agent/internal/local"
 )
 
@@ -31,6 +32,11 @@ type NodeConfig struct {
 	// Reality SNI。与生成器用的是同一个值（来自 REALITY_SNI 配置），
 	// 不能各写死一份 —— 两边不一致客户端就连不上（接线契约 §8）。
 	RealitySNI string `json:"reality_sni"`
+	// 新增四协议端口。为 0 表示该协议未启用，不生成对应链接。
+	VMessPort     int `json:"vmess_port"`
+	TrojanPort    int `json:"trojan_port"`
+	Hysteria2Port int `json:"hysteria2_port"`
+	TUICPort      int `json:"tuic_port"`
 }
 
 // NewLocalAPIServer 创建本地 API 服务
@@ -53,6 +59,32 @@ func (s *LocalAPIServer) RegisterRoutes(mux *http.ServeMux) {
 
 	// 流量统计
 	mux.HandleFunc("/api/local/stats", s.authMiddleware(s.handleStats))
+
+	// 订阅：返回某用户全部协议链接的 base64 汇总
+	mux.HandleFunc("/api/local/subscription/", s.authMiddleware(s.handleSubscription))
+}
+
+// handleSubscription 处理 /api/local/subscription/{uuid}
+// 返回该用户全部协议链接的 base64 汇总（主流客户端订阅格式）。
+func (s *LocalAPIServer) handleSubscription(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	uuid := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/local/subscription/"), "/")
+	if uuid == "" {
+		s.jsonError(w, http.StatusBadRequest, "missing user uuid")
+		return
+	}
+	user, ok := s.store.GetUser(uuid)
+	if !ok {
+		s.jsonError(w, http.StatusNotFound, "user not found")
+		return
+	}
+	sub := s.toUserResponse(user).SubscriptionUrl
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(sub))
 }
 
 // authMiddleware Bearer Token 认证中间件
@@ -248,8 +280,13 @@ type UserResponse struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 	// 连接 URL
-	VLESSUrl string `json:"vless_url,omitempty"`
-	SSUrl    string `json:"ss_url,omitempty"`
+	VLESSUrl        string `json:"vless_url,omitempty"`
+	SSUrl           string `json:"ss_url,omitempty"`
+	VMessUrl        string `json:"vmess_url,omitempty"`
+	TrojanUrl       string `json:"trojan_url,omitempty"`
+	Hysteria2Url    string `json:"hysteria2_url,omitempty"`
+	TUICUrl         string `json:"tuic_url,omitempty"`
+	SubscriptionUrl string `json:"subscription_url,omitempty"`
 }
 
 // toUserResponse 转换为响应格式
@@ -268,16 +305,43 @@ func (s *LocalAPIServer) toUserResponse(u *local.LocalUser) UserResponse {
 	}
 
 	// 生成连接 URL
+	var links []string
 	for _, proto := range u.Protocols {
 		switch proto {
 		case "vless":
 			resp.VLESSUrl = s.generateVLESSUrl(u)
+			links = appendIf(links, resp.VLESSUrl)
 		case "shadowsocks":
 			resp.SSUrl = s.generateSSUrl(u)
+			links = appendIf(links, resp.SSUrl)
+		case "vmess":
+			resp.VMessUrl = s.generateVMessUrl(u)
+			links = appendIf(links, resp.VMessUrl)
+		case "trojan":
+			resp.TrojanUrl = s.generateTrojanUrl(u)
+			links = appendIf(links, resp.TrojanUrl)
+		case "hysteria2":
+			resp.Hysteria2Url = s.generateHysteria2Url(u)
+			links = appendIf(links, resp.Hysteria2Url)
+		case "tuic":
+			resp.TUICUrl = s.generateTUICUrl(u)
+			links = appendIf(links, resp.TUICUrl)
 		}
 	}
 
+	// 订阅链接：把该用户全部协议链接 base64 汇总，主流客户端可一键导入。
+	if len(links) > 0 {
+		resp.SubscriptionUrl = base64.StdEncoding.EncodeToString([]byte(strings.Join(links, "\n")))
+	}
+
 	return resp
+}
+
+func appendIf(links []string, url string) []string {
+	if url != "" {
+		return append(links, url)
+	}
+	return links
 }
 
 // generateVLESSUrl 生成 VLESS 连接 URL
@@ -333,6 +397,91 @@ func (s *LocalAPIServer) generateSSUrl(u *local.LocalUser) string {
 		encoded,
 		s.nodeConfig.ServerIP,
 		s.nodeConfig.SSPort,
+		url.PathEscape(u.Name),
+	)
+}
+
+// generateVMessUrl 生成 VMess 连接 URL（WS，无 TLS）。
+// 格式: vmess://base64(json)
+func (s *LocalAPIServer) generateVMessUrl(u *local.LocalUser) string {
+	if s.nodeConfig == nil || s.nodeConfig.ServerIP == "" || s.nodeConfig.VMessPort == 0 {
+		return ""
+	}
+	v := map[string]any{
+		"v":    "2",
+		"ps":   u.Name,
+		"add":  s.nodeConfig.ServerIP,
+		"port": fmt.Sprintf("%d", s.nodeConfig.VMessPort),
+		"id":   config.VMessUUID(u.UUID),
+		"aid":  "0",
+		"net":  "ws",
+		"type": "none",
+		"host": "",
+		"path": "/vmess",
+		"tls":  "",
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return "vmess://" + base64.StdEncoding.EncodeToString(data)
+}
+
+// generateTrojanUrl 生成 Trojan 连接 URL（自签 TLS，客户端 insecure）。
+// 格式: trojan://password@server:port?security=tls&allowInsecure=1&sni=...&type=tcp#name
+func (s *LocalAPIServer) generateTrojanUrl(u *local.LocalUser) string {
+	if s.nodeConfig == nil || s.nodeConfig.ServerIP == "" || s.nodeConfig.TrojanPort == 0 {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("security", "tls")
+	params.Set("allowInsecure", "1")
+	params.Set("sni", config.SelfCertCN)
+	params.Set("type", "tcp")
+	return fmt.Sprintf("trojan://%s@%s:%d?%s#%s",
+		config.TrojanPassword(u.UUID),
+		s.nodeConfig.ServerIP,
+		s.nodeConfig.TrojanPort,
+		params.Encode(),
+		url.PathEscape(u.Name),
+	)
+}
+
+// generateHysteria2Url 生成 Hysteria2 连接 URL（UDP/QUIC，自签 TLS）。
+// 格式: hysteria2://password@server:port?insecure=1&sni=...#name
+func (s *LocalAPIServer) generateHysteria2Url(u *local.LocalUser) string {
+	if s.nodeConfig == nil || s.nodeConfig.ServerIP == "" || s.nodeConfig.Hysteria2Port == 0 {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("insecure", "1")
+	params.Set("sni", config.SelfCertCN)
+	return fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
+		config.Hysteria2Password(u.UUID),
+		s.nodeConfig.ServerIP,
+		s.nodeConfig.Hysteria2Port,
+		params.Encode(),
+		url.PathEscape(u.Name),
+	)
+}
+
+// generateTUICUrl 生成 TUIC 连接 URL（UDP/QUIC，自签 TLS）。
+// 格式: tuic://uuid:password@server:port?congestion_control=bbr&allow_insecure=1&sni=...#name
+func (s *LocalAPIServer) generateTUICUrl(u *local.LocalUser) string {
+	if s.nodeConfig == nil || s.nodeConfig.ServerIP == "" || s.nodeConfig.TUICPort == 0 {
+		return ""
+	}
+	params := url.Values{}
+	params.Set("congestion_control", "bbr")
+	params.Set("allow_insecure", "1")
+	params.Set("sni", config.SelfCertCN)
+	params.Set("alpn", "h3")
+	return fmt.Sprintf("tuic://%s:%s@%s:%d?%s#%s",
+		config.TUICUUID(u.UUID),
+		config.TUICPassword(u.UUID),
+		s.nodeConfig.ServerIP,
+		s.nodeConfig.TUICPort,
+		params.Encode(),
 		url.PathEscape(u.Name),
 	)
 }
