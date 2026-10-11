@@ -60,8 +60,46 @@ func (s *LocalAPIServer) RegisterRoutes(mux *http.ServeMux) {
 	// 流量统计
 	mux.HandleFunc("/api/local/stats", s.authMiddleware(s.handleStats))
 
-	// 订阅：返回某用户全部协议链接的 base64 汇总
+	// 订阅（需 API key，App 用）：返回某用户全部协议链接的 base64 汇总
 	mux.HandleFunc("/api/local/subscription/", s.authMiddleware(s.handleSubscription))
+
+	// 公开订阅（**免鉴权**，给第三方客户端订阅）：/sub/{token}
+	// token 从 uuid+ss_password 派生，不可遍历；泄露只影响该用户。
+	// 第三方客户端填 http://<ip>:8080/sub/<token> 即可一键导入六协议。
+	mux.HandleFunc("/sub/", s.handlePublicSubscription)
+}
+
+// handlePublicSubscription 处理公开订阅 /sub/{token}（免鉴权）。
+// 用 token 反查用户（遍历匹配派生值），返回其六协议订阅的 base64。
+func (s *LocalAPIServer) handlePublicSubscription(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		s.jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	token := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/sub/"), "/")
+	if token == "" {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	// 遍历用户，匹配派生 token。用户数通常很少，线性查找足够。
+	var matched *local.LocalUser
+	for _, u := range s.store.ListUsers() {
+		if config.SubscriptionToken(u.UUID, u.SSPassword) == token {
+			uu := u
+			matched = &uu
+			break
+		}
+	}
+	if matched == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	sub := s.toUserResponse(matched).SubscriptionUrl
+	// 标准订阅响应：text/plain，base64 内容。部分客户端认 profile 头。
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Profile-Update-Interval", "24")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(sub))
 }
 
 // handleSubscription 处理 /api/local/subscription/{uuid}

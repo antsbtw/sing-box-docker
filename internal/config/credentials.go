@@ -32,6 +32,16 @@ func Hysteria2Password(uuid string) string { return deriveSecret("otun-hy2", uui
 // TUICPassword：TUIC 用户密码。
 func TUICPassword(uuid string) string { return deriveSecret("otun-tuic-pw", uuid) }
 
+// SubscriptionToken：用户订阅链接的公开 token。
+//
+// 从 uuid+ss_password 确定性派生，不进存储、不可遍历（要同时知道这两个秘密
+// 才能算出），泄露只影响该用户。订阅网址形如 http://<ip>:8080/sub/<token>，
+// 第三方客户端无需鉴权即可拉取该用户的六协议订阅。App 侧用同一公式自算。
+func SubscriptionToken(uuid, ssPassword string) string {
+	sum := sha256.Sum256([]byte("otun-sub|" + uuid + "|" + ssPassword))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
 // TUICUUID：TUIC 要求 uuid 形的用户标识，从原 UUID 确定性派生一个 v5 风格的 UUID。
 func TUICUUID(uuid string) string {
 	sum := sha256.Sum256([]byte("otun-tuic-uuid|" + uuid))
