@@ -229,10 +229,23 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 			agent.regenerateConfig()
 		})
 
+		// 服务器公网 IP：优先用下发的 SERVER_IP；没下发（App 直连 SSH 装机
+		// 不传此变量）就自动探测。否则所有分享链接/订阅都因缺 IP 返回空，
+		// 客户端导入得到「无效配置」。
+		serverIP := cfg.ServerIP
+		if serverIP == "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			serverIP = enroll.DetectPublicIP(ctx)
+			cancel()
+			if serverIP != "" {
+				log.Printf("SERVER_IP not set, auto-detected public IP: %s", serverIP)
+			}
+		}
+
 		// 创建本地 API 服务
 		nodeConfig := &api.NodeConfig{
 			NodeID:        cfg.NodeID,
-			ServerIP:      cfg.ServerIP,
+			ServerIP:      serverIP,
 			PublicKey:     secrets.PublicKey,
 			ShortID:       secrets.ShortIDs[0],
 			VLESSPort:     cfg.VLESSPort,
@@ -247,10 +260,10 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 		agent.localAPI = api.NewLocalAPIServer(agent.localStore, cfg.NodeAPIKey, nodeConfig)
 
 		log.Printf("Local management API enabled")
-		if cfg.ServerIP != "" {
-			log.Printf("Server IP: %s", cfg.ServerIP)
+		if serverIP != "" {
+			log.Printf("Server IP: %s", serverIP)
 		} else {
-			log.Printf("Warning: SERVER_IP not set, connection URLs will be incomplete")
+			log.Printf("Warning: SERVER_IP not set and auto-detect failed, connection URLs will be incomplete")
 		}
 	}
 
