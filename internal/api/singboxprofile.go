@@ -121,7 +121,10 @@ func (s *LocalAPIServer) buildSingBoxProfile(u *local.LocalUser) ([]byte, error)
 		"dns": map[string]any{
 			"servers": []map[string]any{
 				{"tag": "google", "type": "tls", "server": "8.8.8.8", "detour": "节点选择"},
-				{"tag": "local", "type": "udp", "server": "223.5.5.5", "detour": "direct"},
+				// local 不设 detour：1.14 不允许 DNS detour 到空的 direct outbound
+				// （报 "detour to an empty direct outbound makes no sense"）。
+				// 走默认路由即可，中国域名由 route 规则直连。
+				{"tag": "local", "type": "udp", "server": "223.5.5.5"},
 			},
 			"rules": []map[string]any{
 				{"rule_set": "geosite-cn", "server": "local"},
@@ -135,6 +138,8 @@ func (s *LocalAPIServer) buildSingBoxProfile(u *local.LocalUser) ([]byte, error)
 		"route": map[string]any{
 			"default_domain_resolver": "local",
 			"rule_set": []map[string]any{
+				// download_detour：1.14 有个 deprecation warning（1.16 才移除），
+				// 但 1.14 仍需用它让规则集走代理下载，暂保留。
 				{"type": "remote", "tag": "geosite-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", "download_detour": "节点选择"},
 				{"type": "remote", "tag": "geoip-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs", "download_detour": "节点选择"},
 			},
