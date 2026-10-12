@@ -94,8 +94,24 @@ func (s *LocalAPIServer) handlePublicSubscription(w http.ResponseWriter, r *http
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+
+	// sing-box 客户端的 import-remote-profile 要 sing-box JSON，不是通用 base64。
+	// 按 User-Agent 区分：含 sing-box 返回 JSON，其他（Shadowrocket/Clash/
+	// v2rayN…）返回 base64 节点链接。
+	ua := strings.ToLower(r.Header.Get("User-Agent"))
+	if strings.Contains(ua, "sing-box") || strings.Contains(ua, "sfa") || strings.Contains(ua, "sfi") {
+		if data, err := s.buildSingBoxProfile(matched); err == nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Profile-Update-Interval", "24")
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+			return
+		}
+		// 生成失败则退回 base64，总比 500 好。
+	}
+
 	sub := s.toUserResponse(matched).SubscriptionUrl
-	// 标准订阅响应：text/plain，base64 内容。部分客户端认 profile 头。
+	// 通用订阅响应：text/plain，base64 内容。部分客户端认 profile 头。
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Profile-Update-Interval", "24")
 	w.WriteHeader(http.StatusOK)
