@@ -95,18 +95,18 @@ func (s *LocalAPIServer) handlePublicSubscription(w http.ResponseWriter, r *http
 		return
 	}
 
-	// 返回格式判定：
+	// 返回格式判定：**默认返回通用 base64 节点列表**（机场订阅的标准行为，
+	// 所有客户端——Shadowrocket/Clash/v2rayN/OTun-M 等都认），**只有显式要求
+	// 才返回 sing-box JSON**。
 	//
-	// 1. **?flag= 参数优先**（机场订阅业界约定，优先级高于 UA）。带 flag（如
-	//    flag=v2ray/clash/quanx…）表示客户端明确要「通用节点列表」，必须返回
-	//    base64。OTun-M 等基于 sing-box 内核的 fork，UA 会带 sing-box 字样，
-	//    但它拉订阅时加 flag=v2ray 强制要节点列表——必须尊重，否则误判成
-	//    sing-box 给了 JSON，OTun-M 解不出（2026-10-12 OTun-M 问题反馈）。
-	// 2. 没有 flag 时，才按 User-Agent：**官方 sing-box** 的 import-remote-profile
-	//    要 sing-box JSON；其他（Shadowrocket/Clash/v2rayN…）给 base64。
-	ua := strings.ToLower(r.Header.Get("User-Agent"))
-	wantsNodeList := r.URL.Query().Get("flag") != ""
-	if !wantsNodeList && (strings.Contains(ua, "sing-box") || strings.Contains(ua, "sfa") || strings.Contains(ua, "sfi")) {
+	// ⚠️ 之前按 User-Agent「含 sing-box 就给 JSON」是错的：OTun-M 等基于
+	// sing-box 内核的 fork UA 也含 sing-box，会被误判成官方 sing-box 拿到 JSON
+	// 而解不出（2026-10-12 OTun-M 反馈）。改为显式信号，不再猜 UA。
+	//
+	// 要 JSON 的唯一方式：URL 带 ?format=singbox。OBox App 给 sing-box 客户端
+	// 的「打开 sing-box」链接会带上它（import-remote-profile 需要 sing-box
+	// 自己的 JSON profile）。其余一律 base64。
+	if r.URL.Query().Get("format") == "singbox" {
 		if data, err := s.buildSingBoxProfile(matched); err == nil {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.Header().Set("Profile-Update-Interval", "24")
@@ -118,7 +118,7 @@ func (s *LocalAPIServer) handlePublicSubscription(w http.ResponseWriter, r *http
 	}
 
 	sub := s.toUserResponse(matched).SubscriptionUrl
-	// 通用订阅响应：text/plain，base64 内容。部分客户端认 profile 头。
+	// 默认：通用 base64 节点列表。text/plain，部分客户端认 profile 头。
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Profile-Update-Interval", "24")
 	w.WriteHeader(http.StatusOK)
