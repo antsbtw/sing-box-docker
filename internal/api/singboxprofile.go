@@ -138,10 +138,10 @@ func (s *LocalAPIServer) buildSingBoxProfile(u *local.LocalUser) ([]byte, error)
 		"route": map[string]any{
 			"default_domain_resolver": "local",
 			"rule_set": []map[string]any{
-				// download_detour：1.14 有个 deprecation warning（1.16 才移除），
-				// 但 1.14 仍需用它让规则集走代理下载，暂保留。
-				{"type": "remote", "tag": "geosite-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", "download_detour": "节点选择"},
-				{"type": "remote", "tag": "geoip-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs", "download_detour": "节点选择"},
+				// 规则集走代理下载：1.14 新写法 http_client.detour（取代已弃用的
+				// download_detour，后者 1.16 移除且会弹「弃用警告」弹窗）。
+				{"type": "remote", "tag": "geosite-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-cn.srs", "http_client": map[string]any{"detour": "节点选择"}},
+				{"type": "remote", "tag": "geoip-cn", "format": "binary", "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs", "http_client": map[string]any{"detour": "节点选择"}},
 			},
 			// 1.14 用 action：sniff 探测、hijack-dns 劫持 DNS、中国直连。
 			"rules": []map[string]any{
