@@ -95,11 +95,18 @@ func (s *LocalAPIServer) handlePublicSubscription(w http.ResponseWriter, r *http
 		return
 	}
 
-	// sing-box 客户端的 import-remote-profile 要 sing-box JSON，不是通用 base64。
-	// 按 User-Agent 区分：含 sing-box 返回 JSON，其他（Shadowrocket/Clash/
-	// v2rayN…）返回 base64 节点链接。
+	// 返回格式判定：
+	//
+	// 1. **?flag= 参数优先**（机场订阅业界约定，优先级高于 UA）。带 flag（如
+	//    flag=v2ray/clash/quanx…）表示客户端明确要「通用节点列表」，必须返回
+	//    base64。OTun-M 等基于 sing-box 内核的 fork，UA 会带 sing-box 字样，
+	//    但它拉订阅时加 flag=v2ray 强制要节点列表——必须尊重，否则误判成
+	//    sing-box 给了 JSON，OTun-M 解不出（2026-10-12 OTun-M 问题反馈）。
+	// 2. 没有 flag 时，才按 User-Agent：**官方 sing-box** 的 import-remote-profile
+	//    要 sing-box JSON；其他（Shadowrocket/Clash/v2rayN…）给 base64。
 	ua := strings.ToLower(r.Header.Get("User-Agent"))
-	if strings.Contains(ua, "sing-box") || strings.Contains(ua, "sfa") || strings.Contains(ua, "sfi") {
+	wantsNodeList := r.URL.Query().Get("flag") != ""
+	if !wantsNodeList && (strings.Contains(ua, "sing-box") || strings.Contains(ua, "sfa") || strings.Contains(ua, "sfi")) {
 		if data, err := s.buildSingBoxProfile(matched); err == nil {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.Header().Set("Profile-Update-Interval", "24")
