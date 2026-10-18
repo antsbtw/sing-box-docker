@@ -52,6 +52,9 @@ func (s *HealthServer) HandleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":  status,
 		"uptime":  time.Since(s.startTime).String(),
 		"version": "1.1.0",
+		// App 据此判断这台 agent 支持哪些功能。上面的 version 是写死的
+		// API 版本号，不随 release 变，不能拿来判断新旧。
+		"features": []string{"residential_exit"},
 	})
 }
 

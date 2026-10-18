@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -29,6 +30,20 @@ const (
 	// 进程活过这么久就算这次启动成功。
 	// bind 失败通常在几十毫秒内发生，5 秒足够区分。
 	startSettleWindow = 5 * time.Second
+
+	// ResidentialFile 是住宅IP出口的附加配置，与 config.json 同目录。
+	//
+	// App 经终端写入/删除它；agent 只在启动 sing-box 时多带一个 -c，
+	// sing-box 自己把两份合并（outbounds 追加、route 合并）。
+	// 这样 agent 重写 config.json 时不会抹掉住宅出口 —— 那份文件
+	// 每次同步、增删用户都会被整个重新生成。
+	ResidentialFile = "residential.json"
+
+	// 带着 residential.json 连续起不来这么多次，就把它挪开、不带它再启动。
+	//
+	// 住宅出口填错不能拖垮原有节点。App 正常流程会自己回滚，
+	// 但终端中途断开时没人回滚，只能 agent 兜底。
+	residentialMaxFailures = 2
 )
 
 // Manager 管理 sing-box 进程
@@ -101,7 +116,7 @@ func (m *Manager) startLocked() error {
 		log.Printf("[sing-box] 清理了 %d 个残留进程后再启动", n)
 	}
 
-	m.cmd = exec.Command(m.binPath, "run", "-c", m.configPath)
+	m.cmd = exec.Command(m.binPath, m.args("run")...)
 	// sing-box 自己的日志（含启动失败的 FATAL 行）直接进 journal，
 	// 否则调用方只能看到一句 "exit status 1"，查不出为什么。
 	m.cmd.Stdout = os.Stdout
@@ -276,6 +291,15 @@ func (m *Manager) monitor(gen uint64, cmd *exec.Cmd) {
 	m.consecutiveFailures++
 	failures := m.consecutiveFailures
 
+	// 住宅出口兜底：带着 residential.json 连续起不来，多半是它填错了。
+	// 挪成 .failed（App 据此提示"已自动停用"），清零计数，不带它重来。
+	if failures >= residentialMaxFailures && m.disableResidential() {
+		log.Printf("[sing-box] 带住宅出口连续 %d 次启动失败，已停用 %s（改名为 .failed）",
+			failures, ResidentialFile)
+		m.consecutiveFailures = 0
+		failures = 1 // 退避从头算，下面立即按最短间隔重启
+	}
+
 	if failures >= maxConsecutiveFailures {
 		m.stopped = true
 		m.mu.Unlock()
@@ -310,9 +334,38 @@ func (m *Manager) monitor(gen uint64, cmd *exec.Cmd) {
 	}
 }
 
+// residentialPath 是住宅出口附加配置的完整路径。
+func (m *Manager) residentialPath() string {
+	return filepath.Join(filepath.Dir(m.configPath), ResidentialFile)
+}
+
+// args 拼 sing-box 子命令参数：residential.json 存在时追加第二个 -c。
+//
+// ⚠️ 主配置必须排第一个：reapStrays 按 "<bin> run -c <config>" 前缀匹配残留进程。
+func (m *Manager) args(sub string) []string {
+	a := []string{sub, "-c", m.configPath}
+	if _, err := os.Stat(m.residentialPath()); err == nil {
+		a = append(a, "-c", m.residentialPath())
+	}
+	return a
+}
+
+// disableResidential 把 residential.json 挪成 .failed。文件不存在时返回 false。
+func (m *Manager) disableResidential() bool {
+	p := m.residentialPath()
+	if _, err := os.Stat(p); err != nil {
+		return false
+	}
+	if err := os.Rename(p, p+".failed"); err != nil {
+		log.Printf("[sing-box] 停用 %s 失败：%v", ResidentialFile, err)
+		return false
+	}
+	return true
+}
+
 // CheckConfig 验证配置文件
 func (m *Manager) CheckConfig() error {
-	cmd := exec.Command(m.binPath, "check", "-c", m.configPath)
+	cmd := exec.Command(m.binPath, m.args("check")...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("config check failed: %s", string(output))
