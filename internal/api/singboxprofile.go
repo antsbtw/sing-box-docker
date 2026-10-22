@@ -132,7 +132,10 @@ func (s *LocalAPIServer) buildSingBoxProfile(u *local.LocalUser) ([]byte, error)
 			"final": "google",
 		},
 		"inbounds": []map[string]any{
-			{"type": "tun", "address": []string{"172.19.0.1/30"}, "auto_route": true, "strict_route": true, "stack": "gvisor"},
+			// 双栈：TUN 必须同时有 v4、v6 地址。只给 v4 的话手机上的 IPv6 流量进不了隧道 ——
+			// 要么绕过代理直连，要么连不上（IPv6-only 网站打不开）。外层仍按订阅里的地址连，
+			// 隧道里访问 v4 还是 v6 站点由服务器出站决定。
+			{"type": "tun", "address": []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"}, "auto_route": true, "strict_route": true, "stack": "gvisor"},
 		},
 		"outbounds": all,
 		"route": map[string]any{

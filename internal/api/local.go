@@ -4,8 +4,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -405,6 +407,12 @@ func appendIf(links []string, url string) []string {
 	return links
 }
 
+// hostPort 拼分享链接里的 host:port。IPv6 地址要加方括号（[2001:db8::1]:443），
+// 原来写 "%s:%d"，v6 地址拼出来客户端分不清哪段是端口。
+func (s *LocalAPIServer) hostPort(port int) string {
+	return net.JoinHostPort(strings.Trim(s.nodeConfig.ServerIP, "[]"), strconv.Itoa(port))
+}
+
 // generateVLESSUrl 生成 VLESS 连接 URL
 // 格式: vless://uuid@server:port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=sni&fp=chrome&pbk=publickey&sid=shortid&type=tcp#name
 func (s *LocalAPIServer) generateVLESSUrl(u *local.LocalUser) string {
@@ -429,10 +437,9 @@ func (s *LocalAPIServer) generateVLESSUrl(u *local.LocalUser) string {
 	params.Set("sid", s.nodeConfig.ShortID)
 	params.Set("type", "tcp")
 
-	return fmt.Sprintf("vless://%s@%s:%d?%s#%s",
+	return fmt.Sprintf("vless://%s@%s?%s#%s",
 		u.UUID,
-		s.nodeConfig.ServerIP,
-		s.nodeConfig.VLESSPort,
+		s.hostPort(s.nodeConfig.VLESSPort),
 		params.Encode(),
 		url.PathEscape(u.Name),
 	)
@@ -454,10 +461,9 @@ func (s *LocalAPIServer) generateSSUrl(u *local.LocalUser) string {
 	userInfo := fmt.Sprintf("%s:%s", method, u.SSPassword)
 	encoded := base64.URLEncoding.EncodeToString([]byte(userInfo))
 
-	return fmt.Sprintf("ss://%s@%s:%d#%s",
+	return fmt.Sprintf("ss://%s@%s#%s",
 		encoded,
-		s.nodeConfig.ServerIP,
-		s.nodeConfig.SSPort,
+		s.hostPort(s.nodeConfig.SSPort),
 		url.PathEscape(u.Name),
 	)
 }
@@ -499,10 +505,9 @@ func (s *LocalAPIServer) generateTrojanUrl(u *local.LocalUser) string {
 	params.Set("allowInsecure", "1")
 	params.Set("sni", config.SelfCertCN)
 	params.Set("type", "tcp")
-	return fmt.Sprintf("trojan://%s@%s:%d?%s#%s",
+	return fmt.Sprintf("trojan://%s@%s?%s#%s",
 		config.TrojanPassword(u.UUID),
-		s.nodeConfig.ServerIP,
-		s.nodeConfig.TrojanPort,
+		s.hostPort(s.nodeConfig.TrojanPort),
 		params.Encode(),
 		url.PathEscape(u.Name),
 	)
@@ -517,10 +522,9 @@ func (s *LocalAPIServer) generateHysteria2Url(u *local.LocalUser) string {
 	params := url.Values{}
 	params.Set("insecure", "1")
 	params.Set("sni", config.SelfCertCN)
-	return fmt.Sprintf("hysteria2://%s@%s:%d?%s#%s",
+	return fmt.Sprintf("hysteria2://%s@%s?%s#%s",
 		config.Hysteria2Password(u.UUID),
-		s.nodeConfig.ServerIP,
-		s.nodeConfig.Hysteria2Port,
+		s.hostPort(s.nodeConfig.Hysteria2Port),
 		params.Encode(),
 		url.PathEscape(u.Name),
 	)
@@ -537,11 +541,10 @@ func (s *LocalAPIServer) generateTUICUrl(u *local.LocalUser) string {
 	params.Set("allow_insecure", "1")
 	params.Set("sni", config.SelfCertCN)
 	params.Set("alpn", "h3")
-	return fmt.Sprintf("tuic://%s:%s@%s:%d?%s#%s",
+	return fmt.Sprintf("tuic://%s:%s@%s?%s#%s",
 		config.TUICUUID(u.UUID),
 		config.TUICPassword(u.UUID),
-		s.nodeConfig.ServerIP,
-		s.nodeConfig.TUICPort,
+		s.hostPort(s.nodeConfig.TUICPort),
 		params.Encode(),
 		url.PathEscape(u.Name),
 	)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"time"
 )
 
 // Generator 生成 sing-box 配置
@@ -72,8 +73,15 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 	var tuicUsers []map[string]any
 	var statsUsers []string
 
+	now := time.Now()
 	for _, u := range users {
 		if !u.Enabled {
+			continue
+		}
+		// 超额、过期的用户不写进配置：sing-box 只认配置里的用户，
+		// 这样才真正停得住（只断连接的话客户端马上重连）。
+		// 调高限额、清零流量或延期后再生成一次配置，用户自动恢复。
+		if u.OverQuota() || u.Expired(now) {
 			continue
 		}
 
@@ -86,6 +94,11 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 			switch proto {
 			case "vless":
 				vlessUsers = append(vlessUsers, map[string]any{
+					// ⚠️ name 必须带：sing-box 按 name 记用户流量（metadata.User），
+					// 没有 name 时 VLESS 的流量一律不记到任何用户名下 ——
+					// 此前 VLESS（主协议）的用量恒为 0。六个协议用同一个 name，
+					// 统计自然按用户跨协议合并。
+					"name": u.UUID,
 					"uuid": u.UUID,
 					"flow": "xtls-rprx-vision",
 				})
@@ -243,13 +256,18 @@ func (g *Generator) Generate(users []User, realitySNI string) map[string]any {
 
 	// TUIC inbound（UDP/QUIC + 自签 TLS）。
 	if g.tuicPort > 0 && hasCert {
+		// ⚠️ TUIC 必须在服务端声明 ALPN：分享链接和订阅都带 alpn=h3，服务端不声明时
+		// 客户端握手报「server did not select an ALPN protocol」，TUIC 一律连不上
+		//（Hysteria2 由 sing-box 自动设 h3，不受影响）。2026-10-22 回归实测。
+		tuicTLS := selfTLS()
+		tuicTLS["alpn"] = []string{"h3"}
 		inbounds = append(inbounds, map[string]any{
 			"type":                "tuic",
 			"tag":                 "tuic-in",
 			"listen":              "::",
 			"listen_port":         g.tuicPort,
 			"congestion_control":  "bbr",
-			"tls":                 selfTLS(),
+			"tls":                 tuicTLS,
 			"users":               orEmpty(tuicUsers),
 		})
 	}

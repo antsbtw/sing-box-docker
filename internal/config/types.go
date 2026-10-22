@@ -47,6 +47,16 @@ type User struct {
 	DeviceID     string     `json:"device_id"` // 绑定的设备指纹
 }
 
+// OverQuota 已用流量达到限额（0 = 不限）
+func (u User) OverQuota() bool {
+	return u.TrafficLimit > 0 && u.TrafficUsed >= u.TrafficLimit
+}
+
+// Expired 已过有效期（nil = 永不过期）
+func (u User) Expired(now time.Time) bool {
+	return u.ExpireAt != nil && now.After(*u.ExpireAt)
+}
+
 // UsersResponse 是管理服务器返回的用户列表
 type UsersResponse struct {
 	Version string `json:"version"`

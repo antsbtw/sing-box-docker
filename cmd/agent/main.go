@@ -44,6 +44,10 @@ type Agent struct {
 	monitor   *quota.Monitor
 	collector *stats.Collector
 	reporter  *stats.Reporter
+	// meter 把 sing-box 的累计计数换算成增量，给本地用户记账（traffic_used / 限额）
+	meter *stats.Meter
+	// regenMu 串行化「生成配置 + 重启 sing-box」：用户变更回调是并发触发的
+	regenMu sync.Mutex
 
 	// 本地用户管理
 	localStore *local.Store
@@ -197,6 +201,7 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 	reporter := stats.NewReporter(cfg.APIURL, cfg.NodeAPIKey, statsCache)
 
 	agent := &Agent{
+		meter:     stats.NewMeter(),
 		cfg:       cfg,
 		secrets:   secrets,
 		syncer:    syncer,
@@ -513,6 +518,7 @@ func (a *Agent) runMainLoop(ctx context.Context) {
 
 		case <-quotaTicker.C:
 			a.monitor.CheckAllUsers()
+			a.accountLocalTraffic(true)
 
 		default:
 			// 远程/混合模式的定时任务
@@ -544,11 +550,45 @@ func (a *Agent) runMainLoop(ctx context.Context) {
 	}
 }
 
+// accountLocalTraffic 把 sing-box 统计到的流量记到本地用户名下（所有协议合计）。
+//
+// 此前本地 / Token 模式只把累计值报给后端，从不回写 local.Store：
+// App 读到的 traffic_used 恒为 0，traffic_limit 也从未生效（谁都没调过 UpdateTraffic）。
+//
+// 有用户这次刚越过限额时重新生成配置把他停掉（Generate 跳过超额用户，
+// 重启 sing-box 断掉他的现有连接）。regenerate 为 false 时只记账不重生成 ——
+// 给 regenerateConfig 自己在重启前调用。
+func (a *Agent) accountLocalTraffic(regenerate bool) {
+	if a.localStore == nil || !a.manager.IsRunning() {
+		return
+	}
+	current, err := a.collector.Collect()
+	if err != nil {
+		// 每 10 秒一次，失败不刷屏：统计读不到时心跳那边也会记
+		return
+	}
+	crossed := false
+	for uuid, d := range a.meter.Deltas(current) {
+		if a.localStore.AddTraffic(uuid, d.Upload, d.Download) {
+			log.Printf("User %s reached traffic limit, disabling", uuid)
+			crossed = true
+		}
+	}
+	if crossed && regenerate {
+		go a.regenerateConfig()
+	}
+}
+
 // regenerateConfig 重新生成 sing-box 配置（从本地用户）
 func (a *Agent) regenerateConfig() {
 	if a.localStore == nil {
 		return
 	}
+	a.regenMu.Lock()
+	defer a.regenMu.Unlock()
+
+	// 重启前先记一次账：重启会把 sing-box 的计数器清零，上次读数之后的流量就丢了
+	a.accountLocalTraffic(false)
 
 	localUsers := a.localStore.ListUsers()
 	users := make([]config.User, 0, len(localUsers))
@@ -588,6 +628,8 @@ func (a *Agent) regenerateConfig() {
 	// 而想让 agent 重读 SKIP_SINGBOX 只能重启进程 —— 那会掐断
 	// App 正连着的隧道。所以改为：收到 reload 时按「二进制在不在」
 	// 判断，而不是认启动时的那个环境变量。
+	// 重启 / 启动之后计数器从 0 开始（重启前已记过账）
+	defer a.meter.Reset()
 	if a.manager.IsRunning() {
 		log.Println("Reloading sing-box...")
 		if err := a.manager.Reload(); err != nil {

@@ -362,15 +362,22 @@ func (s *Store) DeleteUser(uuid string) error {
 	return nil
 }
 
-// UpdateTraffic 更新用户流量
-func (s *Store) UpdateTraffic(uuid string, upload, download int64) {
+// AddTraffic 把一段增量记到用户名下，并落盘。
+//
+// 返回这次是否**刚好越过**限额（之前没到、现在到了）：调用方据此重新生成配置，
+// 把用户停掉。已经超额的用户再记流量不会重复返回 true。
+func (s *Store) AddTraffic(uuid string, upload, download int64) (crossedLimit bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if user, ok := s.users[uuid]; ok {
-		user.TrafficUsed += upload + download
-		s.save() // 异步保存，忽略错误
+	user, ok := s.users[uuid]
+	if !ok || upload+download <= 0 {
+		return false
 	}
+	before := user.TrafficUsed
+	user.TrafficUsed += upload + download
+	s.save() // 失败只影响持久化，下次记账会再写
+	return user.TrafficLimit > 0 && before < user.TrafficLimit && user.TrafficUsed >= user.TrafficLimit
 }
 
 // Clear 清空全部本地用户并落盘。
