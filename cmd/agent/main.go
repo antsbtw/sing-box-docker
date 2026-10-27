@@ -246,11 +246,26 @@ func NewAgent(cfg *config.AgentConfig) (*Agent, error) {
 				log.Printf("SERVER_IP not set, auto-detected public IP: %s", serverIP)
 			}
 		}
+		// 公网 IPv6：订阅和分享里另给一套 IPv6 链接（用户在客户端里自己选 v4 / v6），
+		// OTun-M 订阅（?format=otun）里作 url_v6。没有就不出 IPv6 链接，其他功能不受影响
+		serverIPv6 := cfg.ServerIPv6
+		if serverIPv6 == "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			serverIPv6 = enroll.DetectPublicIPv6(ctx)
+			cancel()
+			if serverIPv6 != "" {
+				log.Printf("Public IPv6 detected: %s", serverIPv6)
+			}
+		} else if !enroll.IsPublicIPv6(serverIPv6) {
+			log.Printf("SERVER_IPV6=%s is not a public IPv6, ignored", serverIPv6)
+			serverIPv6 = ""
+		}
 
 		// 创建本地 API 服务
 		nodeConfig := &api.NodeConfig{
 			NodeID:        cfg.NodeID,
 			ServerIP:      serverIP,
+			ServerIPv6:    serverIPv6,
 			PublicKey:     secrets.PublicKey,
 			ShortID:       secrets.ShortIDs[0],
 			VLESSPort:     cfg.VLESSPort,

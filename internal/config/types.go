@@ -32,6 +32,7 @@ type AgentConfig struct {
 	LogLevel       string
 	ManagementMode ManagementMode // 管理模式
 	ServerIP       string         // 服务器公网 IP（用于生成连接 URL）
+	ServerIPv6     string         // 服务器公网 IPv6：订阅与分享里另给一套 IPv6 链接；空则自动探测
 	RealitySNI     string
 }
 

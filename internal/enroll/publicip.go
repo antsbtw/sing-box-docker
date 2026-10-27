@@ -42,14 +42,52 @@ func DetectPublicIP(ctx context.Context) string {
 	}
 
 	for _, url := range publicIPEndpoints {
-		if ip := fetchIP(ctx, client, url); ip != "" {
+		if ip := fetchIP(ctx, client, url, false); ip != "" {
 			return ip
 		}
 	}
 	return "" // 契约允许留空
 }
 
-func fetchIP(ctx context.Context, client *http.Client, url string) string {
+// publicIPv6Endpoints 只有 AAAA 记录的查询地址，配合 tcp6 拨号，拿到的一定是 v6。
+var publicIPv6Endpoints = []string{
+	"https://api6.ipify.org",
+	"https://ipv6.icanhazip.com",
+	"https://api-ipv6.ip.sb/ip",
+}
+
+// DetectPublicIPv6 返回本机公网 IPv6（全局单播），没有或探测失败返回空串。
+//
+// 用来另给一套 IPv6 链接（订阅、分享、OTun-M 的 url_v6）。主链接与 SERVER_IP 仍用 v4
+// （见 DetectPublicIP 的说明），这里拿不到只是不出 IPv6 链接，不影响任何既有功能。
+func DetectPublicIPv6(ctx context.Context) string {
+	dialer := &net.Dialer{Timeout: publicIPTimeout}
+	client := &http.Client{
+		Timeout: publicIPTimeout,
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp6", addr)
+			},
+		},
+	}
+	for _, url := range publicIPv6Endpoints {
+		if ip := fetchIP(ctx, client, url, true); ip != "" {
+			return ip
+		}
+	}
+	return ""
+}
+
+// IsPublicIPv6 是不是可以给客户端用的公网 IPv6：全局单播，排除 ULA（fc00::/7）
+func IsPublicIPv6(s string) bool {
+	ip := net.ParseIP(strings.Trim(s, "[]"))
+	if ip == nil || ip.To4() != nil || !ip.IsGlobalUnicast() {
+		return false
+	}
+	return ip[0]&0xfe != 0xfc
+}
+
+func fetchIP(ctx context.Context, client *http.Client, url string, wantV6 bool) string {
 	reqCtx, cancel := context.WithTimeout(ctx, publicIPTimeout)
 	defer cancel()
 
@@ -74,6 +112,12 @@ func fetchIP(ctx context.Context, client *http.Client, url string) string {
 
 	ip := strings.TrimSpace(string(body))
 	parsed := net.ParseIP(ip)
+	if wantV6 {
+		if !IsPublicIPv6(ip) {
+			return ""
+		}
+		return parsed.String()
+	}
 	if parsed == nil || parsed.To4() == nil {
 		return "" // 不是合法 IPv4 就当没拿到
 	}

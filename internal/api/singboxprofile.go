@@ -31,71 +31,79 @@ func (s *LocalAPIServer) buildSingBoxProfile(u *local.LocalUser) ([]byte, error)
 		sni = "www.apple.com"
 	}
 
-	for _, proto := range u.Protocols {
-		switch proto {
-		case "vless":
-			add(map[string]any{
-				"type": "vless", "tag": "VLESS-Reality",
-				"server": nc.ServerIP, "server_port": nc.VLESSPort,
-				"uuid": u.UUID, "flow": "xtls-rprx-vision",
-				"tls": map[string]any{
-					"enabled": true, "server_name": sni,
-					"utls":    map[string]any{"enabled": true, "fingerprint": "chrome"},
-					"reality": map[string]any{"enabled": true, "public_key": nc.PublicKey, "short_id": nc.ShortID},
-				},
-			})
-		case "shadowsocks":
-			method := nc.SSMethod
-			if method == "" {
-				method = "chacha20-ietf-poly1305"
+	// 每个协议一个出站；服务器有公网 IPv6 时再各加一个「· IPv6」出站。
+	// 都进「自动选择」：手机没有 IPv6 时 v6 出站测速失败，自然不会被选中
+	emit := func(server, suffix string) {
+		for _, proto := range u.Protocols {
+			switch proto {
+			case "vless":
+				add(map[string]any{
+					"type": "vless", "tag": "VLESS-Reality" + suffix,
+					"server": server, "server_port": nc.VLESSPort,
+					"uuid": u.UUID, "flow": "xtls-rprx-vision",
+					"tls": map[string]any{
+						"enabled": true, "server_name": sni,
+						"utls":    map[string]any{"enabled": true, "fingerprint": "chrome"},
+						"reality": map[string]any{"enabled": true, "public_key": nc.PublicKey, "short_id": nc.ShortID},
+					},
+				})
+			case "shadowsocks":
+				method := nc.SSMethod
+				if method == "" {
+					method = "chacha20-ietf-poly1305"
+				}
+				add(map[string]any{
+					"type": "shadowsocks", "tag": "Shadowsocks" + suffix,
+					"server": server, "server_port": nc.SSPort,
+					"method": method, "password": u.SSPassword,
+				})
+			case "vmess":
+				if nc.VMessPort == 0 {
+					continue
+				}
+				add(map[string]any{
+					"type": "vmess", "tag": "VMess" + suffix,
+					"server": server, "server_port": nc.VMessPort,
+					"uuid": config.VMessUUID(u.UUID), "security": "auto", "alter_id": 0,
+					"transport": map[string]any{"type": "ws", "path": "/vmess"},
+				})
+			case "trojan":
+				if nc.TrojanPort == 0 {
+					continue
+				}
+				add(map[string]any{
+					"type": "trojan", "tag": "Trojan" + suffix,
+					"server": server, "server_port": nc.TrojanPort,
+					"password": config.TrojanPassword(u.UUID),
+					"tls":      map[string]any{"enabled": true, "server_name": config.SelfCertCN, "insecure": true},
+				})
+			case "hysteria2":
+				if nc.Hysteria2Port == 0 {
+					continue
+				}
+				add(map[string]any{
+					"type": "hysteria2", "tag": "Hysteria2" + suffix,
+					"server": server, "server_port": nc.Hysteria2Port,
+					"password": config.Hysteria2Password(u.UUID),
+					"tls":      map[string]any{"enabled": true, "server_name": config.SelfCertCN, "insecure": true, "alpn": []string{"h3"}},
+				})
+			case "tuic":
+				if nc.TUICPort == 0 {
+					continue
+				}
+				add(map[string]any{
+					"type": "tuic", "tag": "TUIC" + suffix,
+					"server": server, "server_port": nc.TUICPort,
+					"uuid": config.TUICUUID(u.UUID), "password": config.TUICPassword(u.UUID),
+					"congestion_control": "bbr",
+					"tls":                map[string]any{"enabled": true, "server_name": config.SelfCertCN, "insecure": true, "alpn": []string{"h3"}},
+				})
 			}
-			add(map[string]any{
-				"type": "shadowsocks", "tag": "Shadowsocks",
-				"server": nc.ServerIP, "server_port": nc.SSPort,
-				"method": method, "password": u.SSPassword,
-			})
-		case "vmess":
-			if nc.VMessPort == 0 {
-				continue
-			}
-			add(map[string]any{
-				"type": "vmess", "tag": "VMess",
-				"server": nc.ServerIP, "server_port": nc.VMessPort,
-				"uuid": config.VMessUUID(u.UUID), "security": "auto", "alter_id": 0,
-				"transport": map[string]any{"type": "ws", "path": "/vmess"},
-			})
-		case "trojan":
-			if nc.TrojanPort == 0 {
-				continue
-			}
-			add(map[string]any{
-				"type": "trojan", "tag": "Trojan",
-				"server": nc.ServerIP, "server_port": nc.TrojanPort,
-				"password": config.TrojanPassword(u.UUID),
-				"tls":      map[string]any{"enabled": true, "server_name": config.SelfCertCN, "insecure": true},
-			})
-		case "hysteria2":
-			if nc.Hysteria2Port == 0 {
-				continue
-			}
-			add(map[string]any{
-				"type": "hysteria2", "tag": "Hysteria2",
-				"server": nc.ServerIP, "server_port": nc.Hysteria2Port,
-				"password": config.Hysteria2Password(u.UUID),
-				"tls":      map[string]any{"enabled": true, "server_name": config.SelfCertCN, "insecure": true, "alpn": []string{"h3"}},
-			})
-		case "tuic":
-			if nc.TUICPort == 0 {
-				continue
-			}
-			add(map[string]any{
-				"type": "tuic", "tag": "TUIC",
-				"server": nc.ServerIP, "server_port": nc.TUICPort,
-				"uuid": config.TUICUUID(u.UUID), "password": config.TUICPassword(u.UUID),
-				"congestion_control": "bbr",
-				"tls":                map[string]any{"enabled": true, "server_name": config.SelfCertCN, "insecure": true, "alpn": []string{"h3"}},
-			})
 		}
+	}
+	emit(nc.ServerIP, "")
+	if nc.ServerIPv6 != "" {
+		emit(nc.ServerIPv6, " · IPv6")
 	}
 
 	// selector（手动）+ urltest（自动）放在节点之前。

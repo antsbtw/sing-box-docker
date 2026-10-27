@@ -33,6 +33,7 @@ func LoadFromEnv() *AgentConfig {
 		LogLevel:       getEnv("LOG_LEVEL", "info"),
 		ManagementMode: mode,
 		ServerIP:       getEnv("SERVER_IP", ""), // 服务器公网 IP，用于生成连接 URL
+		ServerIPv6:     getEnv("SERVER_IPV6", ""), // 公网 IPv6，另给一套 IPv6 链接用；空则自动探测
 		// Reality 握手借用的真实站点域名。
 		//
 		// ⚠️ 这是 local 模式下 SNI 的**唯一来源**：配置生成、分享链接、

@@ -20,17 +20,49 @@ type LocalAPIServer struct {
 	store      *local.Store
 	apiKey     string
 	nodeConfig *NodeConfig
+	// 节点名里是否加「· IPv6」。只在 v6Server() 复制出的实例上为 true
+	ipv6Label bool
+	// 节点名里是否不加协议名（OTun 契约要 url_v6 与 url 逐字相同，名字沿用）
+	plainNames bool
+}
+
+// nodeName 链接里显示的节点名：「用户名 · 协议」，IPv6 再加「· IPv6」。
+//
+// 原来六个协议都只写用户名，Clash 只好把它们改名成「名字、名字-01、-02…」，
+// 分不清哪个是哪个协议（2026-10-22 iPhone 回归）；现在又多了 IPv6 节点，更要区分。
+func (s *LocalAPIServer) nodeName(u *local.LocalUser, proto string) string {
+	if s.plainNames {
+		return u.Name
+	}
+	name := u.Name + " · " + proto
+	if s.ipv6Label {
+		name += " · IPv6"
+	}
+	return name
+}
+
+// v6Server 地址换成公网 IPv6 的副本，用同一套生成函数出 IPv6 链接（除地址和名字外完全相同）。
+// 服务器没有公网 IPv6 时返回 nil
+func (s *LocalAPIServer) v6Server(label bool) *LocalAPIServer {
+	if s.nodeConfig == nil || s.nodeConfig.ServerIPv6 == "" {
+		return nil
+	}
+	nc := *s.nodeConfig
+	nc.ServerIP = s.nodeConfig.ServerIPv6
+	return &LocalAPIServer{store: s.store, apiKey: s.apiKey, nodeConfig: &nc, ipv6Label: label, plainNames: s.plainNames}
 }
 
 // NodeConfig 节点配置信息
 type NodeConfig struct {
-	NodeID    string `json:"node_id"`
-	ServerIP  string `json:"server_ip"`
-	PublicKey string `json:"public_key"`
-	ShortID   string `json:"short_id"`
-	VLESSPort int    `json:"vless_port"`
-	SSPort    int    `json:"ss_port"`
-	SSMethod  string `json:"ss_method"`
+	NodeID   string `json:"node_id"`
+	ServerIP string `json:"server_ip"`
+	// 公网 IPv6。空表示没有：此时不出 IPv6 链接，其他一切照旧
+	ServerIPv6 string `json:"server_ipv6,omitempty"`
+	PublicKey  string `json:"public_key"`
+	ShortID    string `json:"short_id"`
+	VLESSPort  int    `json:"vless_port"`
+	SSPort     int    `json:"ss_port"`
+	SSMethod   string `json:"ss_method"`
 	// Reality SNI。与生成器用的是同一个值（来自 REALITY_SNI 配置），
 	// 不能各写死一份 —— 两边不一致客户端就连不上（接线契约 §8）。
 	RealitySNI string `json:"reality_sni"`
@@ -117,6 +149,20 @@ func (s *LocalAPIServer) handlePublicSubscription(w http.ResponseWriter, r *http
 			return
 		}
 		// 生成失败则退回 base64，总比 500 好。
+	}
+
+	// OTun-M 专用：协议条目列表，带 url_v6（v6 优先、退回 v4）。只在显式要求时给 ——
+	// 老版 OTun-M 见到以「{」开头的正文会当成 sing-box 配置（2026-10-12 的教训），
+	// 所以默认响应保持 base64 不变。契约：OBox Documents/Refactor-v2/CONTRACT_OTUNM_OBOX_IPV6_2026-10-27.md
+	if r.URL.Query().Get("format") == "otun" {
+		data, err := json.Marshal(s.buildOTunSubscription(matched))
+		if err == nil {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Profile-Update-Interval", "24")
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+			return
+		}
 	}
 
 	sub := s.toUserResponse(matched).SubscriptionUrl
@@ -343,12 +389,19 @@ type UserResponse struct {
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 	// 连接 URL
-	VLESSUrl        string `json:"vless_url,omitempty"`
-	SSUrl           string `json:"ss_url,omitempty"`
-	VMessUrl        string `json:"vmess_url,omitempty"`
-	TrojanUrl       string `json:"trojan_url,omitempty"`
-	Hysteria2Url    string `json:"hysteria2_url,omitempty"`
-	TUICUrl         string `json:"tuic_url,omitempty"`
+	VLESSUrl     string `json:"vless_url,omitempty"`
+	SSUrl        string `json:"ss_url,omitempty"`
+	VMessUrl     string `json:"vmess_url,omitempty"`
+	TrojanUrl    string `json:"trojan_url,omitempty"`
+	Hysteria2Url string `json:"hysteria2_url,omitempty"`
+	TUICUrl      string `json:"tuic_url,omitempty"`
+	// IPv6 链接：服务器有公网 IPv6 时才有，用户在客户端里自己选 v4 或 v6
+	VLESSUrlV6      string `json:"vless_url_v6,omitempty"`
+	SSUrlV6         string `json:"ss_url_v6,omitempty"`
+	VMessUrlV6      string `json:"vmess_url_v6,omitempty"`
+	TrojanUrlV6     string `json:"trojan_url_v6,omitempty"`
+	Hysteria2UrlV6  string `json:"hysteria2_url_v6,omitempty"`
+	TUICUrlV6       string `json:"tuic_url_v6,omitempty"`
 	SubscriptionUrl string `json:"subscription_url,omitempty"`
 }
 
@@ -392,6 +445,33 @@ func (s *LocalAPIServer) toUserResponse(u *local.LocalUser) UserResponse {
 		}
 	}
 
+	// IPv6 链接：服务器有公网 IPv6 时，每个协议再给一条 IPv6 的，排在全部 IPv4 之后。
+	// 一条链接只能写一个地址，所以 v4、v6 各一个节点，由用户在 Clash / Shadowrocket 里自己选
+	if v6 := s.v6Server(true); v6 != nil {
+		for _, proto := range u.Protocols {
+			switch proto {
+			case "vless":
+				resp.VLESSUrlV6 = v6.generateVLESSUrl(u)
+				links = appendIf(links, resp.VLESSUrlV6)
+			case "shadowsocks":
+				resp.SSUrlV6 = v6.generateSSUrl(u)
+				links = appendIf(links, resp.SSUrlV6)
+			case "vmess":
+				resp.VMessUrlV6 = v6.generateVMessUrl(u)
+				links = appendIf(links, resp.VMessUrlV6)
+			case "trojan":
+				resp.TrojanUrlV6 = v6.generateTrojanUrl(u)
+				links = appendIf(links, resp.TrojanUrlV6)
+			case "hysteria2":
+				resp.Hysteria2UrlV6 = v6.generateHysteria2Url(u)
+				links = appendIf(links, resp.Hysteria2UrlV6)
+			case "tuic":
+				resp.TUICUrlV6 = v6.generateTUICUrl(u)
+				links = appendIf(links, resp.TUICUrlV6)
+			}
+		}
+	}
+
 	// 订阅链接：把该用户全部协议链接 base64 汇总，主流客户端可一键导入。
 	if len(links) > 0 {
 		resp.SubscriptionUrl = base64.StdEncoding.EncodeToString([]byte(strings.Join(links, "\n")))
@@ -405,6 +485,70 @@ func appendIf(links []string, url string) []string {
 		return append(links, url)
 	}
 	return links
+}
+
+// OTunProtocol 与 OTun 后端下发的 protocols[] 条目同形（OTun-M VPNProtocolConfig）
+type OTunProtocol struct {
+	Protocol string `json:"protocol"`
+	URL      string `json:"url"`
+	URLV6    string `json:"url_v6,omitempty"`
+	Node     string `json:"node"`
+}
+
+// OTunSubscription OTun-M 订阅（?format=otun）的响应体
+type OTunSubscription struct {
+	Version   int            `json:"version"`
+	Name      string         `json:"name"`
+	Protocols []OTunProtocol `json:"protocols"`
+}
+
+// otunV6Protocols 带 url_v6 的协议：只有 TCP 类。OTun-M 内核对 UDP（hy2 / tuic / ss 的 DNS）
+// 只用第一个地址、没有退回 v4，v6 不通就整个连不上（OTun BASIC_NODES_IPV6_DELIVERY_DESIGN C1–C4）
+var otunV6Protocols = map[string]bool{"vless": true, "vmess": true, "trojan": true}
+
+// buildOTunSubscription 按用户启用的协议生成条目。url 是 v4 地址的标准链接；有公网 IPv6 时，
+// TCP 类协议再带 url_v6 —— 用同一个生成函数、只换地址，保证除地址外逐字相同（契约 C3）
+func (s *LocalAPIServer) buildOTunSubscription(u *local.LocalUser) OTunSubscription {
+	sub := OTunSubscription{Version: 1, Name: u.Name, Protocols: []OTunProtocol{}}
+	// 名字沿用用户名、不加协议和「IPv6」：契约 C3 要 url_v6 除地址外与 url 逐字相同
+	plain := &LocalAPIServer{store: s.store, apiKey: s.apiKey, nodeConfig: s.nodeConfig, plainNames: true}
+	v6 := plain.v6Server(false)
+	s = plain
+	gens := []struct {
+		name string
+		gen  func(*LocalAPIServer, *local.LocalUser) string
+	}{
+		{"vless", (*LocalAPIServer).generateVLESSUrl},
+		{"shadowsocks", (*LocalAPIServer).generateSSUrl},
+		{"vmess", (*LocalAPIServer).generateVMessUrl},
+		{"trojan", (*LocalAPIServer).generateTrojanUrl},
+		{"hysteria2", (*LocalAPIServer).generateHysteria2Url},
+		{"tuic", (*LocalAPIServer).generateTUICUrl},
+	}
+	for _, g := range gens {
+		if !userHasProtocol(u, g.name) {
+			continue
+		}
+		url := g.gen(s, u)
+		if url == "" {
+			continue // 协议未启用（端口为 0）或缺地址
+		}
+		p := OTunProtocol{Protocol: g.name, URL: url, Node: "primary"}
+		if v6 != nil && otunV6Protocols[g.name] {
+			p.URLV6 = g.gen(v6, u)
+		}
+		sub.Protocols = append(sub.Protocols, p)
+	}
+	return sub
+}
+
+func userHasProtocol(u *local.LocalUser, name string) bool {
+	for _, p := range u.Protocols {
+		if p == name {
+			return true
+		}
+	}
+	return false
 }
 
 // hostPort 拼分享链接里的 host:port。IPv6 地址要加方括号（[2001:db8::1]:443），
@@ -441,7 +585,7 @@ func (s *LocalAPIServer) generateVLESSUrl(u *local.LocalUser) string {
 		u.UUID,
 		s.hostPort(s.nodeConfig.VLESSPort),
 		params.Encode(),
-		url.PathEscape(u.Name),
+		url.PathEscape(s.nodeName(u, "VLESS")),
 	)
 }
 
@@ -464,7 +608,7 @@ func (s *LocalAPIServer) generateSSUrl(u *local.LocalUser) string {
 	return fmt.Sprintf("ss://%s@%s#%s",
 		encoded,
 		s.hostPort(s.nodeConfig.SSPort),
-		url.PathEscape(u.Name),
+		url.PathEscape(s.nodeName(u, "Shadowsocks")),
 	)
 }
 
@@ -476,7 +620,7 @@ func (s *LocalAPIServer) generateVMessUrl(u *local.LocalUser) string {
 	}
 	v := map[string]any{
 		"v":    "2",
-		"ps":   u.Name,
+		"ps":   s.nodeName(u, "VMess"),
 		"add":  s.nodeConfig.ServerIP,
 		"port": fmt.Sprintf("%d", s.nodeConfig.VMessPort),
 		"id":   config.VMessUUID(u.UUID),
@@ -509,7 +653,7 @@ func (s *LocalAPIServer) generateTrojanUrl(u *local.LocalUser) string {
 		config.TrojanPassword(u.UUID),
 		s.hostPort(s.nodeConfig.TrojanPort),
 		params.Encode(),
-		url.PathEscape(u.Name),
+		url.PathEscape(s.nodeName(u, "Trojan")),
 	)
 }
 
@@ -526,7 +670,7 @@ func (s *LocalAPIServer) generateHysteria2Url(u *local.LocalUser) string {
 		config.Hysteria2Password(u.UUID),
 		s.hostPort(s.nodeConfig.Hysteria2Port),
 		params.Encode(),
-		url.PathEscape(u.Name),
+		url.PathEscape(s.nodeName(u, "Hysteria2")),
 	)
 }
 
@@ -546,7 +690,7 @@ func (s *LocalAPIServer) generateTUICUrl(u *local.LocalUser) string {
 		config.TUICPassword(u.UUID),
 		s.hostPort(s.nodeConfig.TUICPort),
 		params.Encode(),
-		url.PathEscape(u.Name),
+		url.PathEscape(s.nodeName(u, "TUIC")),
 	)
 }
 

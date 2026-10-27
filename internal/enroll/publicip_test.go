@@ -16,7 +16,7 @@ func TestFetchIPAcceptsValidIPv4(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	got := fetchIP(context.Background(), srv.Client(), srv.URL)
+	got := fetchIP(context.Background(), srv.Client(), srv.URL, false)
 	if got != "203.0.113.10" {
 		t.Errorf("应解析并去除空白，得到 %q", got)
 	}
@@ -34,7 +34,7 @@ func TestFetchIPRejectsGarbage(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write([]byte(body))
 		}))
-		if got := fetchIP(context.Background(), srv.Client(), srv.URL); got != "" {
+		if got := fetchIP(context.Background(), srv.Client(), srv.URL, false); got != "" {
 			t.Errorf("body=%q 应返回空，得到 %q", body, got)
 		}
 		srv.Close()
@@ -48,7 +48,7 @@ func TestFetchIPRejectsNon200(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := fetchIP(context.Background(), srv.Client(), srv.URL); got != "" {
+	if got := fetchIP(context.Background(), srv.Client(), srv.URL, false); got != "" {
 		t.Errorf("非 200 应返回空，得到 %q", got)
 	}
 }
@@ -60,7 +60,7 @@ func TestFetchIPLimitsBodySize(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if got := fetchIP(context.Background(), srv.Client(), srv.URL); got != "" {
+	if got := fetchIP(context.Background(), srv.Client(), srv.URL, false); got != "" {
 		t.Errorf("超大响应应返回空，得到 %q", got)
 	}
 }
