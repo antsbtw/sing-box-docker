@@ -627,7 +627,8 @@ func (s *LocalAPIServer) generateVMessUrl(u *local.LocalUser) string {
 		"aid":  "0",
 		"net":  "ws",
 		"type": "none",
-		"host": "",
+		// 不写 host：空串会被部分客户端（OTun-M、sing-box 导入）原样写成空 Host 头，
+		// WS 握手带两条 Host，VMess 全部不通（2026-10-28 实测）。没有 host 时客户端用连接地址。
 		"path": "/vmess",
 		"tls":  "",
 	}

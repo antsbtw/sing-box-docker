@@ -128,3 +128,26 @@ func TestSingBoxProfileHasV6Outbounds(t *testing.T) {
 		}
 	}
 }
+
+// vmess 链接不能带空 host：OTun-M 等会照抄成空 Host 头，WS 握手出两条 Host，VMess 全部不通。
+func TestVMessLinkHasNoEmptyHost(t *testing.T) {
+	sub := otunTestServer("2406:da14:1eb6:b300::1").buildOTunSubscription(otunTestUser())
+	for _, p := range sub.Protocols {
+		if p.Protocol != "vmess" {
+			continue
+		}
+		for _, link := range []string{p.URL, p.URLV6} {
+			raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(link, "vmess://"))
+			if err != nil {
+				t.Fatalf("vmess base64: %v", err)
+			}
+			var v map[string]any
+			if err := json.Unmarshal(raw, &v); err != nil {
+				t.Fatalf("vmess json: %v", err)
+			}
+			if h, ok := v["host"]; ok {
+				t.Errorf("vmess link has host=%q, want no host key", h)
+			}
+		}
+	}
+}
